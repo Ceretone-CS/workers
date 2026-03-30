@@ -1,0 +1,15 @@
+services:
+  zendesk-worker:
+    build: .
+    container_name: zendesk-worker
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./service_account.json:/app/service_account.json:ro
+    command: ["python", "-m", "app.main"]
+    restart: "no"

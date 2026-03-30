@@ -1,0 +1,14 @@
+services:
+  appt-worker:
+    build: .
+    container_name: appt-worker
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: always
+    networks:
+      - appt-net
+
+networks:
+  appt-net:
+    external: true

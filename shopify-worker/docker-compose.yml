@@ -1,0 +1,13 @@
+services:
+  shopify-worker:
+    build: .
+    container_name: shopify-worker
+    env_file:
+      - ../.env.common
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets
+      - ./secrets:/secrets:ro
+    restart: always
+

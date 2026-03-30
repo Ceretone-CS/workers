@@ -1,0 +1,16 @@
+services:
+  shopify-order-worker:
+    build: .
+    container_name: shopify-order-worker
+    env_file:
+      - ../.env.common
+      - .env
+    ports:
+      - "3002:3002"
+    restart: always
+    networks:
+      - appt-net
+
+networks:
+  appt-net:
+    external: true

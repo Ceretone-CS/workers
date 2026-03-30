@@ -1,0 +1,16 @@
+services:
+  registration-worker:
+    build: .
+    container_name: registration-worker
+    env_file:
+      - ../.env.common
+      - .env
+    ports:
+      - "3003:3003"
+    restart: always
+    networks:
+      - appt-net
+
+networks:
+  appt-net:
+    external: true

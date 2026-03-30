@@ -1,0 +1,17 @@
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+service_account.json
+secrets/
+
+# Runtime data
+data/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.log
+
+# Dependencies
+node_modules/

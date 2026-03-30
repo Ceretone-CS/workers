@@ -1,0 +1,16 @@
+services:
+  tracking-worker:
+    build: .
+    container_name: tracking-worker
+    env_file:
+      - ../.env.common
+      - .env
+    ports:
+      - "3004:3004"
+    restart: always
+    networks:
+      - appt-net
+
+networks:
+  appt-net:
+    external: true

@@ -1,0 +1,4 @@
+# Suggested crontab entries for shopify-worker
+0 2 * * * cd /home/pwrdbyadobo/docker/workers/shopify-worker && OUT=$(/usr/bin/docker compose run --rm shopify-worker neworders | tee -a data/neworders.log) && ./discord.sh "✅ NEWORDERS OK\n\n$OUT" || ./discord.sh "❌ NEWORDERS FAILED\n$(tail -n 30 data/neworders.log)"
+
+30 2 * * * cd /home/pwrdbyadobo/docker/workers/shopify-worker && OUT=$(/usr/bin/docker compose run --rm shopify-worker updates | tee -a data/updates.log) && ./discord.sh "✅ UPDATES OK\n\n$OUT" || ./discord.sh "❌ UPDATES FAILED\n$(tail -n 30 data/updates.log)"
