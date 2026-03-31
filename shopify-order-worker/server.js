@@ -63,7 +63,9 @@ async function sendDailySummary() {
 
 function scheduleDailySummary() {
   const now  = new Date();
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  // Midnight PST (UTC-8) = 08:00 UTC
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   setTimeout(() => {
     sendDailySummary().catch(console.error);
     setInterval(() => sendDailySummary().catch(console.error), 24 * 60 * 60 * 1000);
@@ -86,12 +88,6 @@ function extractField(text, startLabel, endLabel) {
   return match ? match[1].trim() : '';
 }
 
-/**
- * Normalize product type from order description.
- * Uses "core one pro" before "core one" to avoid false substring match.
- * Only called when the order contains a device SKU — accessory-only orders
- * do NOT update the user's product_type.
- */
 function normalizeProductType(description) {
   const productMap = {
     'core one pro': 'a90',
@@ -277,7 +273,6 @@ app.post('/', async (req, res) => {
       user = await findZendeskUserByEmail(realCustomerEmail, token);
     }
 
-    // Build order history note if key fields changed
     let notesUpdate = '';
     const prevOrder    = user?.user_fields?.order_number;
     const prevPurchase = user?.user_fields?.purchase_date;
@@ -290,10 +285,6 @@ app.post('/', async (req, res) => {
       notesUpdate = `${today}\n${prevOrder}, ${prevSerial}, ${formatDate(prevPurchase)}\n${user?.notes || ''}`.trim();
     }
 
-    // Only update product_type if the order contains an actual device SKU.
-    // Accessory-only orders (ear tips, domes, etc.) should not overwrite the
-    // customer's product type — this was causing A90 customers to be tagged
-    // as A80 when they ordered A80 accessories by mistake.
     const deviceOrder = isDeviceOrder(description);
     const productType = deviceOrder ? normalizeProductType(description) : null;
 
