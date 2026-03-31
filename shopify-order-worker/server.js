@@ -2,21 +2,73 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const os = require('os');
 
 const app = express();
 app.use(express.json());
 
-const ZENDESK_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
-const CLIENT_ID = process.env.ZENDESK_CLIENT_ID;
-const CLIENT_SECRET = process.env.ZENDESK_CLIENT_SECRET;
+const ZENDESK_SUBDOMAIN   = process.env.ZENDESK_SUBDOMAIN;
+const CLIENT_ID           = process.env.ZENDESK_CLIENT_ID;
+const CLIENT_SECRET       = process.env.ZENDESK_CLIENT_SECRET;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const PORT = process.env.PORT || 3002;
 
-let cachedToken = null;
+let cachedToken    = null;
 let tokenExpiresAt = 0;
 
 // SKUs that indicate a device order (not just accessories).
 // Only update product_type when one of these appears in the order.
 const DEVICE_SKUS = ['CE-A90A', 'A80BPAIR', 'CE-A61', 'DW5A', 'D36', 'A18PAIR', 'D12PAIR', 'A62PAIR', 'A39PAIR'];
+
+// ── Daily stats ────────────────────────────────────────────────────────────
+
+const dailyStats = { requests: 0, usersCreated: 0, usersUpdated: 0, partnerOrders: 0, failsafe: 0, errors: 0 };
+
+async function sendDiscord(msg) {
+  if (!DISCORD_WEBHOOK_URL) return;
+  try {
+    await axios.post(DISCORD_WEBHOOK_URL, { content: msg });
+  } catch (e) {
+    console.error('Discord webhook error:', e.message);
+  }
+}
+
+function resetDailyStats() {
+  dailyStats.requests = 0;
+  dailyStats.usersCreated = 0;
+  dailyStats.usersUpdated = 0;
+  dailyStats.partnerOrders = 0;
+  dailyStats.failsafe = 0;
+  dailyStats.errors = 0;
+}
+
+async function sendDailySummary() {
+  const date = new Date().toISOString().split('T')[0];
+  const icon = dailyStats.errors > 0 ? '⚠️' : '📊';
+  const msg = [
+    `${icon} SHOPIFY-ORDER-WORKER DAILY SUMMARY`,
+    ``,
+    `Requests      : ${dailyStats.requests}`,
+    `Users Created : ${dailyStats.usersCreated}`,
+    `Users Updated : ${dailyStats.usersUpdated}`,
+    `Partner Orders: ${dailyStats.partnerOrders}`,
+    `Failsafe      : ${dailyStats.failsafe}`,
+    `Errors        : ${dailyStats.errors}`,
+    `Date: ${date}`,
+    `Host: ${os.hostname()}`
+  ].join('\n');
+  await sendDiscord(msg);
+  resetDailyStats();
+}
+
+function scheduleDailySummary() {
+  const now  = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  setTimeout(() => {
+    sendDailySummary().catch(console.error);
+    setInterval(() => sendDailySummary().catch(console.error), 24 * 60 * 60 * 1000);
+  }, next - now);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -149,7 +201,7 @@ async function getAccessToken(forceRefresh = false) {
     { headers: { 'Content-Type': 'application/json' } }
   );
 
-  cachedToken = response.data.access_token;
+  cachedToken    = response.data.access_token;
   tokenExpiresAt = now + response.data.expires_in * 1000;
   return cachedToken;
 }
@@ -189,12 +241,14 @@ async function findZendeskUserByEmail(email, token) {
 // ── Route ──────────────────────────────────────────────────────────────────
 
 app.post('/', async (req, res) => {
+  dailyStats.requests++;
   try {
     const order = req.body;
     const { description = '', subject = '', ticket_id, created_at } = order;
 
     const customerEmail  = normalizeEmail(description);
     const partnerEmail   = isPartnerEmail(customerEmail);
+    if (partnerEmail) dailyStats.partnerOrders++;
 
     let customerName = normalizeName(subject);
     if (partnerEmail) {
@@ -260,6 +314,7 @@ app.post('/', async (req, res) => {
 
     // ── Failsafe: no contact info, not a partner order ──
     if (!user && !hasContactInfo && !partnerEmail) {
+      dailyStats.failsafe++;
       const failsafeComment = [
         'No customer email or phone number was found in the Shopify order payload.',
         'A Zendesk user could not be created or matched, so the requester was not updated.',
@@ -306,6 +361,7 @@ app.post('/', async (req, res) => {
         token
       );
       user = created.data.user;
+      dailyStats.usersCreated++;
 
     } else if (user) {
       if (realCustomerEmail && user.email !== realCustomerEmail) updates.email = realCustomerEmail;
@@ -319,6 +375,7 @@ app.post('/', async (req, res) => {
         { user: updates },
         token
       );
+      dailyStats.usersUpdated++;
     }
 
     // ── Link user to ticket ──
@@ -355,6 +412,7 @@ app.post('/', async (req, res) => {
     return res.json({ message: 'User and ticket updated successfully' });
 
   } catch (err) {
+    dailyStats.errors++;
     const detail = err.response?.data || err.message || String(err);
     console.error('ERROR:', JSON.stringify(detail, null, 2));
     return res.status(500).json({ error: err.message || 'Unknown error' });
@@ -363,4 +421,7 @@ app.post('/', async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, () => console.log(`shopify-order-worker listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`shopify-order-worker listening on port ${PORT}`);
+  scheduleDailySummary();
+});
