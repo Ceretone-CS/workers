@@ -52,7 +52,9 @@ async function sendDailySummary() {
 
 function scheduleDailySummary() {
   const now  = new Date();
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  // Midnight PST (UTC-8) = 08:00 UTC
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   setTimeout(() => {
     sendDailySummary().catch(console.error);
     setInterval(() => sendDailySummary().catch(console.error), 24 * 60 * 60 * 1000);
@@ -86,7 +88,6 @@ app.post('/', async (req, res) => {
       return res.status(404).json({ error: 'No fulfillments found for this order' });
     }
 
-    // Return all fulfillments — split shipments each get their own entry
     const tracking = fulfillments.map(f => ({
       fulfillment_id:  f.id,
       status:          f.shipment_status || f.status,
