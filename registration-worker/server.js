@@ -2,17 +2,65 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const os = require('os');
 
 const app = express();
 app.use(express.json());
 
-const ZENDESK_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
-const CLIENT_ID        = process.env.ZENDESK_CLIENT_ID;
-const CLIENT_SECRET    = process.env.ZENDESK_CLIENT_SECRET;
-const PORT             = process.env.PORT || 3003;
+const ZENDESK_SUBDOMAIN   = process.env.ZENDESK_SUBDOMAIN;
+const CLIENT_ID           = process.env.ZENDESK_CLIENT_ID;
+const CLIENT_SECRET       = process.env.ZENDESK_CLIENT_SECRET;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const PORT                = process.env.PORT || 3003;
 
 let cachedToken    = null;
 let tokenExpiresAt = 0;
+
+// ── Daily stats ────────────────────────────────────────────────────────────
+
+const dailyStats = { requests: 0, usersUpdated: 0, warrantyExtended: 0, errors: 0 };
+
+async function sendDiscord(msg) {
+  if (!DISCORD_WEBHOOK_URL) return;
+  try {
+    await axios.post(DISCORD_WEBHOOK_URL, { content: msg });
+  } catch (e) {
+    console.error('Discord webhook error:', e.message);
+  }
+}
+
+function resetDailyStats() {
+  dailyStats.requests = 0;
+  dailyStats.usersUpdated = 0;
+  dailyStats.warrantyExtended = 0;
+  dailyStats.errors = 0;
+}
+
+async function sendDailySummary() {
+  const date = new Date().toISOString().split('T')[0];
+  const icon = dailyStats.errors > 0 ? '⚠️' : '📊';
+  const msg = [
+    `${icon} REGISTRATION-WORKER DAILY SUMMARY`,
+    ``,
+    `Requests         : ${dailyStats.requests}`,
+    `Users Updated    : ${dailyStats.usersUpdated}`,
+    `Warranty Extended: ${dailyStats.warrantyExtended}`,
+    `Errors           : ${dailyStats.errors}`,
+    `Date: ${date}`,
+    `Host: ${os.hostname()}`
+  ].join('\n');
+  await sendDiscord(msg);
+  resetDailyStats();
+}
+
+function scheduleDailySummary() {
+  const now  = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  setTimeout(() => {
+    sendDailySummary().catch(console.error);
+    setInterval(() => sendDailySummary().catch(console.error), 24 * 60 * 60 * 1000);
+  }, next - now);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -125,6 +173,7 @@ async function zendeskRequest(method, url, data = null, retry = true) {
 // ── Route ──────────────────────────────────────────────────────────────────
 
 app.post('/', async (req, res) => {
+  dailyStats.requests++;
   try {
     const body = req.body;
     const { requester_id, created_at, ticket_id, subject, description } = body;
@@ -148,7 +197,7 @@ app.post('/', async (req, res) => {
       console.warn(`[ticket ${ticket_id}] Empty fields: ${emptyFields.join(', ')}`);
     }
 
-    const formattedCreatedAt   = formatDate(created_at);
+    const formattedCreatedAt    = formatDate(created_at);
     const formattedPurchaseDate = formatDate(parsed.purchase_date);
 
     if (!formattedPurchaseDate) {
@@ -171,6 +220,8 @@ app.post('/', async (req, res) => {
         ? eighteenMonthsOut.toISOString().split('T')[0]
         : null;
 
+    if (newWarrantyExpiration) dailyStats.warrantyExtended++;
+
     // Update user profile
     await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${requester_id}.json`, {
       user: {
@@ -188,6 +239,7 @@ app.post('/', async (req, res) => {
         }
       }
     });
+    dailyStats.usersUpdated++;
 
     // Solve ticket with internal note
     const commentBody = [
@@ -214,6 +266,7 @@ app.post('/', async (req, res) => {
     return res.json({ message: 'User and ticket updated successfully' });
 
   } catch (err) {
+    dailyStats.errors++;
     const detail = err.response?.data || err.message || String(err);
     console.error(`[ticket ${req.body?.ticket_id}] ERROR:`, JSON.stringify(detail, null, 2));
     return res.status(500).json({ error: err.message || 'Unknown error' });
@@ -222,4 +275,7 @@ app.post('/', async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, () => console.log(`registration-worker listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`registration-worker listening on port ${PORT}`);
+  scheduleDailySummary();
+});
