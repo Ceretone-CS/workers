@@ -2,17 +2,19 @@ const express = require('express');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const app = express();
 app.use(express.json());
 
 // --- Config ---
-const ZENDESK_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN || 'audiconcorporation';
-const ZENDESK_API_TOKEN = process.env.ZENDESK_API_TOKEN;
-const ZENDESK_EMAIL     = process.env.ZENDESK_EMAIL || 'ceretonecs@gmail.com';
-const SHEET_ID          = process.env.SHEET_ID;
-const POLL_INTERVAL_MS  = (parseInt(process.env.POLL_INTERVAL_MINUTES) || 60) * 60 * 1000;
-const STATE_FILE        = path.join(__dirname, 'data', 'processed.json');
+const ZENDESK_SUBDOMAIN   = process.env.ZENDESK_SUBDOMAIN || 'audiconcorporation';
+const ZENDESK_API_TOKEN   = process.env.ZENDESK_API_TOKEN;
+const ZENDESK_EMAIL       = process.env.ZENDESK_EMAIL || 'ceretonecs@gmail.com';
+const SHEET_ID            = process.env.SHEET_ID;
+const POLL_INTERVAL_MS    = (parseInt(process.env.POLL_INTERVAL_MINUTES) || 60) * 60 * 1000;
+const STATE_FILE          = path.join(__dirname, 'data', 'processed.json');
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 // --- Zendesk field IDs ---
 const FIELD_RETURN_ACTIVITY  = 31180534996244;
@@ -137,6 +139,18 @@ function zdReq(method, zdPath, body) {
       'Content-Type': 'application/json',
     }
   }, body ? JSON.stringify(body) : undefined);
+}
+
+function sendDiscord(msg) {
+  if (!DISCORD_WEBHOOK_URL) return Promise.resolve();
+  const parsed = new URL(DISCORD_WEBHOOK_URL);
+  const body = JSON.stringify({ content: msg });
+  return httpsRequest({
+    hostname: parsed.hostname,
+    path: parsed.pathname + parsed.search,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  }, body).catch(e => console.error('Discord webhook error:', e.message));
 }
 
 function fetchSheet() {
@@ -269,6 +283,8 @@ async function runPoll() {
     csv = await fetchSheet();
   } catch (e) {
     console.error('Failed to fetch sheet:', e.message);
+    const ts = new Date().toUTCString();
+    await sendDiscord(`❌ RETURNS POLL FAILED\n\nFailed to fetch sheet: ${e.message}\nHost: ${os.hostname()}\nTime: ${ts}`);
     running = false;
     return;
   }
@@ -306,7 +322,23 @@ async function runPoll() {
     await new Promise(r => setTimeout(r, 1100));
   }
 
+  const ts = new Date().toUTCString();
+  const icon = stats.lastRunErrors > 0 ? '❌' : '✅';
+  const status = stats.lastRunErrors > 0 ? 'RETURNS POLL ERRORS' : 'RETURNS POLL OK';
+  const summary = [
+    `${icon} ${status}`,
+    ``,
+    `Rows Seen    : ${stats.lastRunRows}`,
+    `Created      : ${stats.lastRunCreated}`,
+    `Skipped      : ${stats.lastRunSkipped}`,
+    `Errors       : ${stats.lastRunErrors}`,
+    `Total Created: ${stats.totalCreated}`,
+    `Host: ${os.hostname()}`,
+    `Time: ${ts}`
+  ].join('\n');
+
   console.log('[' + new Date().toISOString() + '] Done. Created: ' + stats.lastRunCreated + ', Skipped: ' + stats.lastRunSkipped + ', Errors: ' + stats.lastRunErrors);
+  await sendDiscord(summary);
   running = false;
 }
 
