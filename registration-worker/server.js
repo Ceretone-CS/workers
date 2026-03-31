@@ -55,7 +55,9 @@ async function sendDailySummary() {
 
 function scheduleDailySummary() {
   const now  = new Date();
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  // Midnight PST (UTC-8) = 08:00 UTC
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   setTimeout(() => {
     sendDailySummary().catch(console.error);
     setInterval(() => sendDailySummary().catch(console.error), 24 * 60 * 60 * 1000);
@@ -90,7 +92,6 @@ function formatDate(dateString) {
 
 function normalizeProductType(raw) {
   const map = {
-    // "core one pro" must come before "core one" to avoid substring collision
     'core one pro': 'a90',
     'core one':     'a80',
     'beacon':       'dw5a',
@@ -178,7 +179,6 @@ app.post('/', async (req, res) => {
     const body = req.body;
     const { requester_id, created_at, ticket_id, subject, description } = body;
 
-    // Parse all fields from the concatenated form body
     const parsed = {
       name:          extractField(description, 'First name', 'Email'),
       email:         extractField(description, 'Email',      'Phone'),
@@ -187,11 +187,9 @@ app.post('/', async (req, res) => {
       product_type:  extractField(description, 'Product',    'Purchased from'),
       purchased_from:extractField(description, 'Purchased from', 'Purchase date'),
       purchase_date: extractField(description, 'Purchase date',  'Serial number'),
-      // Fixed: was using a hardcoded form artifact that never matched
       serial_number: extractField(description, 'Serial number', 'Please upload')
     };
 
-    // Log any empty fields so we can catch form structure changes early
     const emptyFields = Object.entries(parsed).filter(([,v]) => !v).map(([k]) => k);
     if (emptyFields.length) {
       console.warn(`[ticket ${ticket_id}] Empty fields: ${emptyFields.join(', ')}`);
@@ -204,13 +202,10 @@ app.post('/', async (req, res) => {
       console.error(`[ticket ${ticket_id}] Could not parse purchase date: ${repr(parsed.purchase_date)}`);
     }
 
-    // Fetch existing user to evaluate warranty
     const userRes      = await zendeskRequest('get', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${requester_id}.json`);
     const existingUser = userRes.data.user;
     const existingWarranty = existingUser.user_fields?.warranty_expiration;
 
-    // Set warranty to 18 months from purchase, unless they already have
-    // a warranty expiring beyond that (e.g. a purchased extension)
     const eighteenMonthsOut   = new Date(formattedPurchaseDate);
     eighteenMonthsOut.setMonth(eighteenMonthsOut.getMonth() + 18);
     const existingWarrantyDate = existingWarranty ? new Date(existingWarranty) : null;
@@ -222,7 +217,6 @@ app.post('/', async (req, res) => {
 
     if (newWarrantyExpiration) dailyStats.warrantyExtended++;
 
-    // Update user profile
     await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${requester_id}.json`, {
       user: {
         name:  parsed.name,
@@ -241,7 +235,6 @@ app.post('/', async (req, res) => {
     });
     dailyStats.usersUpdated++;
 
-    // Solve ticket with internal note
     const commentBody = [
       'Customer details updated:',
       `Ticket ID:          ${ticket_id}`,
