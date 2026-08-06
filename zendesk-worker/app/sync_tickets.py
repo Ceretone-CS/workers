@@ -1,3 +1,4 @@
+import time as _time
 from app.zendesk_api import iter_incremental_tickets, get_user
 from app.mappings.fields import (
     ORDER_NUMBER,
@@ -12,7 +13,8 @@ from app.sheets import (
     get_spreadsheet,
     ensure_headers,
     append_rows,
-    get_existing_ticket_ids,
+    batch_update_rows,
+    get_ticket_id_to_row_map,
     sort_sheet_by_column,
 )
 from app.config import (
@@ -21,6 +23,8 @@ from app.config import (
     IGNORED_TICKET_FORMS,
     TICKETS_WORKSHEET,
     INCREMENTAL_LOOKBACK_SECONDS,
+    UPDATE_LOOKBACK_DAYS,
+    SPREADSHEET_ID_2,
 )
 from app.utils.state import get_resume_state, start_run, checkpoint_run, complete_run
 
@@ -164,12 +168,40 @@ def flush_batch(ws, batch, batch_last_generated_timestamp, batch_last_ticket_id,
     return written
 
 
+def flush_updates(ws, updates):
+    if not updates:
+        return
+    batch_update_rows(ws, updates)
+    print(f"Updated {len(updates)} existing rows in place.", flush=True)
+
+
 def run_ticket_sync(mode="backfill"):
-    start_time = _get_start_time(mode)
+    checkpoint_start_time = _get_start_time(mode)
+
+    # Extend lookback to catch tickets updated in the last UPDATE_LOOKBACK_DAYS days,
+    # even if they were already written to the sheet on a previous run.
+    update_cutoff = int(_time.time()) - (UPDATE_LOOKBACK_DAYS * 24 * 60 * 60)
+    start_time = str(min(int(checkpoint_start_time), update_cutoff))
+    if start_time != checkpoint_start_time:
+        print(
+            f"Extended start_time from {checkpoint_start_time} to {start_time} "
+            f"to cover {UPDATE_LOOKBACK_DAYS}-day update window.",
+            flush=True,
+        )
+
     start_run(mode, start_time)
 
     ss = get_spreadsheet()
     ws = ss.worksheet(TICKETS_WORKSHEET)
+
+    ws2 = None
+    ticket_row_map2 = {}
+    if SPREADSHEET_ID_2:
+        ss2 = get_spreadsheet(SPREADSHEET_ID_2)
+        try:
+            ws2 = ss2.worksheet(TICKETS_WORKSHEET)
+        except Exception:
+            ws2 = ss2.add_worksheet(title=TICKETS_WORKSHEET, rows=1000, cols=20)
 
     headers = [
         "Ticket Number",
@@ -184,13 +216,25 @@ def run_ticket_sync(mode="backfill"):
         "Status",
     ]
     ensure_headers(ws, headers)
+    if ws2:
+        ensure_headers(ws2, headers)
 
-    existing_ids = get_existing_ticket_ids(ws)
-    print(f"Loaded {len(existing_ids)} existing ticket ids from worksheet '{TICKETS_WORKSHEET}'", flush=True)
+    # Load {ticket_id: row_number} so we can update existing rows in place
+    ticket_row_map = get_ticket_id_to_row_map(ws)
+    if ws2:
+        ticket_row_map2 = get_ticket_id_to_row_map(ws2)
+    existing_ids = set(ticket_row_map.keys()) | set(ticket_row_map2.keys())
+    print(
+        f"Loaded {len(existing_ids)} existing ticket ids from worksheets",
+        flush=True,
+    )
 
-    batch = []
+    batch_new = []
+    batch_updates = []   # [(row_number, row_data)] for ws
+    batch_updates2 = []  # [(row_number, row_data)] for ws2
     scanned = 0
     written = 0
+    updated = 0
     max_generated_timestamp = None
     last_written_ticket_id = None
     batch_last_generated_timestamp = None
@@ -208,37 +252,58 @@ def run_ticket_sync(mode="backfill"):
         if scanned % 100 == 0:
             print(f"Scanned {scanned} tickets so far... last ticket id: {ticket_id}", flush=True)
 
-        if not ticket_id or ticket_id in existing_ids:
+        if not ticket_id:
             continue
 
         row = build_ticket_row(ticket)
         if not row:
             continue
 
-        batch.append(row)
-        existing_ids.add(ticket_id)
-        batch_last_generated_timestamp = generated_timestamp
-        batch_last_ticket_id = ticket_id
-        last_written_ticket_id = ticket_id
+        if ticket_id in existing_ids:
+            # Ticket already in sheet — update it in place
+            if ticket_id in ticket_row_map:
+                batch_updates.append((ticket_row_map[ticket_id], row))
+            if ws2 and ticket_id in ticket_row_map2:
+                batch_updates2.append((ticket_row_map2[ticket_id], row))
 
-        if len(batch) >= BATCH_WRITE_SIZE:
-            written = flush_batch(
-                ws,
-                batch,
-                batch_last_generated_timestamp,
-                batch_last_ticket_id,
-                mode,
-                start_time,
-                written,
-            )
-            batch = []
-            batch_last_generated_timestamp = None
-            batch_last_ticket_id = None
+            if len(batch_updates) >= BATCH_WRITE_SIZE:
+                flush_updates(ws, batch_updates)
+                if ws2 and batch_updates2:
+                    flush_updates(ws2, batch_updates2)
+                updated += len(batch_updates)
+                batch_updates = []
+                batch_updates2 = []
+        else:
+            # New ticket — append it
+            batch_new.append(row)
+            existing_ids.add(ticket_id)
+            batch_last_generated_timestamp = generated_timestamp
+            batch_last_ticket_id = ticket_id
+            last_written_ticket_id = ticket_id
 
-    if batch:
+            if len(batch_new) >= BATCH_WRITE_SIZE:
+                if ws2:
+                    append_rows(ws2, batch_new)
+                written = flush_batch(
+                    ws,
+                    batch_new,
+                    batch_last_generated_timestamp,
+                    batch_last_ticket_id,
+                    mode,
+                    start_time,
+                    written,
+                )
+                batch_new = []
+                batch_last_generated_timestamp = None
+                batch_last_ticket_id = None
+
+    # Final flush — new rows first, then updates
+    if batch_new:
+        if ws2:
+            append_rows(ws2, batch_new)
         written = flush_batch(
             ws,
-            batch,
+            batch_new,
             batch_last_generated_timestamp,
             batch_last_ticket_id,
             mode,
@@ -246,10 +311,21 @@ def run_ticket_sync(mode="backfill"):
             written,
         )
 
+    if batch_updates:
+        flush_updates(ws, batch_updates)
+        updated += len(batch_updates)
+    if ws2 and batch_updates2:
+        flush_updates(ws2, batch_updates2)
+
     sort_sheet_by_column(ws, 2, "asc", start_row=2)
+    if ws2:
+        sort_sheet_by_column(ws2, 2, "asc", start_row=2)
     print(f"Sorted {TICKETS_WORKSHEET} by Created At (oldest first, header excluded)")
 
-    print(f"Ticket sync complete. Mode: {mode}. Scanned: {scanned}. Written: {written}")
+    print(
+        f"Ticket sync complete. Mode: {mode}. Scanned: {scanned}. "
+        f"New rows written: {written}. Existing rows updated: {updated}."
+    )
 
     complete_run(
         mode=mode,

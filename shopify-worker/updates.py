@@ -59,6 +59,7 @@ SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 # Google Sheets
 SHEET_ID = os.environ["SHEET_ID"]
+SHEET_ID_2 = os.environ.get("SHEET_ID_2", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Shopify Orders3")
 GOOGLE_SA_JSON = os.environ["GOOGLE_SA_JSON"]
 
@@ -89,6 +90,34 @@ def a1(col: int) -> str:
         s = chr(65 + r) + s
     return s
 
+
+def read_order_id_to_row_map(svc, sheet_id):
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id,
+        range=f"{SHEET_NAME}!A:A",
+        valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
+    result = {}
+    for i, row in enumerate(resp.get("values", []), start=1):
+        if i < 2 or not row:
+            continue
+        try:
+            result[int(float(row[0]))] = i
+        except Exception:
+            pass
+    return result
+
+
+def batch_write_single_column_mapped(svc, updates_with_oid, col, row_map, sheet_id):
+    mapped = []
+    for u in updates_with_oid:
+        row_index = row_map.get(u["orderId"])
+        if row_index:
+            mapped.append({"rowIndex": row_index, "value": u["value"]})
+    if mapped:
+        batch_write_single_column(svc, mapped, col, sheet_id)
+
+
 def get_last_row(svc) -> int:
     resp = svc.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
@@ -107,7 +136,7 @@ def read_block(svc, start_row: int, end_row: int, start_col: int, end_col: int):
     ).execute()
     return resp.get("values", [])
 
-def batch_write_single_column(svc, updates, col: int):
+def batch_write_single_column(svc, updates, col: int, sheet_id=None):
     if not updates:
         return
     updates.sort(key=lambda x: x["rowIndex"])
@@ -136,7 +165,7 @@ def batch_write_single_column(svc, updates, col: int):
 
     svc.spreadsheets().values().batchUpdate(
         spreadsheetId=SHEET_ID,
-        body={"valueInputOption": "RAW", "data": data},
+        body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
 
 def flush_shipping_writes(svc, ship_updates, carrier_updates, fulfill_updates, serial_updates, delivery_updates):
@@ -408,12 +437,12 @@ def process_row(now_utc, cutoff_fields, cutoff_refund, row_index, row,
         if ship_blank:
             info = get_ship_date_and_carrier(order_id)
             if info and info.get("shipDate"):
-                ship_updates.append({"rowIndex": row_index, "value": info["shipDate"]})
+                ship_updates.append({"rowIndex": row_index, "orderId": order_id, "value": info["shipDate"]})
                 ship_known_now = True
                 ship_dt = info.get("shipDt")
 
                 if info.get("carrier"):
-                    carrier_updates.append({"rowIndex": row_index, "value": info["carrier"]})
+                    carrier_updates.append({"rowIndex": row_index, "orderId": order_id, "value": info["carrier"]})
 
         if ship_known_now:
             # Carrier if ship date present
@@ -421,13 +450,13 @@ def process_row(now_utc, cutoff_fields, cutoff_refund, row_index, row,
                 if info is None:
                     info = get_ship_date_and_carrier(order_id)
                 if info and info.get("carrier"):
-                    carrier_updates.append({"rowIndex": row_index, "value": info["carrier"]})
+                    carrier_updates.append({"rowIndex": row_index, "orderId": order_id, "value": info["carrier"]})
 
             # Fulfillment status if shipped and column H is blank
             if fulfill_blank:
                 fs = get_fulfillment_status(order_id)
                 if fs:
-                    fulfill_updates.append({"rowIndex": row_index, "value": fs})
+                    fulfill_updates.append({"rowIndex": row_index, "orderId": order_id, "value": fs})
 
             # Serial if shipped
             if serial_blank:
@@ -435,20 +464,20 @@ def process_row(now_utc, cutoff_fields, cutoff_refund, row_index, row,
                 sn = normalize_serial(mf)
                 time.sleep(META_SLEEP_S)
                 if sn:
-                    serial_updates.append({"rowIndex": row_index, "value": sn})
+                    serial_updates.append({"rowIndex": row_index, "orderId": order_id, "value": sn})
 
             # Delivery if shipped + blank + >=24h since ship
             if delivery_blank and ship_dt and shipped_long_enough_for_delivery_check(ship_dt, now_utc):
                 dd = get_delivered_date(order_id)
                 if dd:
-                    delivery_updates.append({"rowIndex": row_index, "value": dd})
+                    delivery_updates.append({"rowIndex": row_index, "orderId": order_id, "value": dd})
 
     # -------------------------
     # 90-day REFUND check
     # -------------------------
     shop_fin = get_financial_status(order_id)
     if shop_fin == "refunded" and fin_sheet != "refunded":
-        fin_status_updates.append({"rowIndex": row_index, "value": "refunded"})
+        fin_status_updates.append({"rowIndex": row_index, "orderId": order_id, "value": "refunded"})
 
     time.sleep(PER_ORDER_SLEEP_S)
     return eligible_inc, False, order_name
@@ -462,6 +491,7 @@ def main():
     if last_row < 2:
         print("No rows to process.")
         return
+    row_map_2 = read_order_id_to_row_map(svc, SHEET_ID_2) if SHEET_ID_2 else {}
 
     now_utc = datetime.now(timezone.utc)
     cutoff_fields = now_utc - timedelta(days=FIELDS_LOOKBACK_DAYS)
@@ -478,6 +508,13 @@ def main():
     serial_updates = []
     delivery_updates = []
     fin_status_updates = []
+    # Persistent accumulators for SHEET_ID_2 (not cleared between chunk flushes)
+    all_ship = []
+    all_carrier = []
+    all_fulfill = []
+    all_serial = []
+    all_delivery = []
+    all_fin = []
 
     ship_total = 0
     carrier_total = 0
@@ -524,6 +561,10 @@ def main():
             serial_total += len(serial_updates)
             delivery_total += len(delivery_updates)
             # ✅ Write shipping updates immediately after each chunk
+            if SHEET_ID_2:
+                all_ship.extend(ship_updates); all_carrier.extend(carrier_updates)
+                all_fulfill.extend(fulfill_updates); all_serial.extend(serial_updates)
+                all_delivery.extend(delivery_updates)
             flush_shipping_writes(svc, ship_updates, carrier_updates, fulfill_updates, serial_updates, delivery_updates)
 
             if MAX_ELIGIBLE_PER_RUN and eligible >= MAX_ELIGIBLE_PER_RUN:
@@ -569,6 +610,10 @@ def main():
             serial_total += len(serial_updates)
             delivery_total += len(delivery_updates)
             # ✅ Write shipping updates immediately after each chunk
+            if SHEET_ID_2:
+                all_ship.extend(ship_updates); all_carrier.extend(carrier_updates)
+                all_fulfill.extend(fulfill_updates); all_serial.extend(serial_updates)
+                all_delivery.extend(delivery_updates)
             flush_shipping_writes(svc, ship_updates, carrier_updates, fulfill_updates, serial_updates, delivery_updates)
 
             if MAX_ELIGIBLE_PER_RUN and eligible >= MAX_ELIGIBLE_PER_RUN:
@@ -581,6 +626,11 @@ def main():
     delivery_total += len(delivery_updates)
 
     # Final: write any remaining shipping updates
+    if SHEET_ID_2:
+        all_ship.extend(ship_updates); all_carrier.extend(carrier_updates)
+        all_fulfill.extend(fulfill_updates); all_serial.extend(serial_updates)
+        all_delivery.extend(delivery_updates)
+        all_fin.extend(fin_status_updates)
     flush_shipping_writes(
         svc,
         ship_updates,
@@ -594,6 +644,13 @@ def main():
 
     # Final: write refunded status updates
     batch_write_single_column(svc, fin_status_updates, FIN_STATUS_COL)
+    if SHEET_ID_2 and row_map_2:
+        batch_write_single_column_mapped(svc, all_ship, SHIP_DATE_COL, row_map_2, SHEET_ID_2)
+        batch_write_single_column_mapped(svc, all_carrier, CARRIER_COL, row_map_2, SHEET_ID_2)
+        batch_write_single_column_mapped(svc, all_fulfill, FULFILL_STATUS_COL, row_map_2, SHEET_ID_2)
+        batch_write_single_column_mapped(svc, all_serial, SERIAL_COL, row_map_2, SHEET_ID_2)
+        batch_write_single_column_mapped(svc, all_delivery, DELIVERY_DATE_COL, row_map_2, SHEET_ID_2)
+        batch_write_single_column_mapped(svc, all_fin, FIN_STATUS_COL, row_map_2, SHEET_ID_2)
 
     print(
         f"Updates Complete\n"

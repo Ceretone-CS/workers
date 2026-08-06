@@ -2,17 +2,76 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const os = require('os');
 
 const app = express();
 app.use(express.json());
 
-const ZENDESK_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN;
-const CLIENT_ID        = process.env.ZENDESK_CLIENT_ID;
-const CLIENT_SECRET    = process.env.ZENDESK_CLIENT_SECRET;
-const PORT             = process.env.PORT || 3003;
+const ZENDESK_SUBDOMAIN   = process.env.ZENDESK_SUBDOMAIN;
+const CLIENT_ID           = process.env.ZENDESK_CLIENT_ID;
+const CLIENT_SECRET       = process.env.ZENDESK_CLIENT_SECRET;
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const PORT                = process.env.PORT || 3003;
 
 let cachedToken    = null;
 let tokenExpiresAt = 0;
+
+// ── Daily stats ────────────────────────────────────────────────────────────
+
+const dailyStats = { requests: 0, usersCreated: 0, usersUpdated: 0, warrantyExtended: 0, skipped: 0, errors: 0 };
+
+// Zendesk agent ID for "Ceretone (DO NOT REPLY)" — the "Shopify::Product
+// Registration" trigger already sets this as the assignee at ticket-creation
+// time, so this worker doesn't need to touch it; kept here only for reference.
+const CERETONE_AGENT_ID = 46221339676692;
+
+async function sendDiscord(msg) {
+  if (!DISCORD_WEBHOOK_URL) return;
+  try {
+    await axios.post(DISCORD_WEBHOOK_URL, { content: msg });
+  } catch (e) {
+    console.error('Discord webhook error:', e.message);
+  }
+}
+
+function resetDailyStats() {
+  dailyStats.requests = 0;
+  dailyStats.usersCreated = 0;
+  dailyStats.usersUpdated = 0;
+  dailyStats.warrantyExtended = 0;
+  dailyStats.skipped = 0;
+  dailyStats.errors = 0;
+}
+
+async function sendDailySummary() {
+  const date = new Date().toISOString().split('T')[0];
+  const icon = dailyStats.errors > 0 ? '⚠️' : '📊';
+  const msg = [
+    `${icon} REGISTRATION-WORKER DAILY SUMMARY`,
+    ``,
+    `Requests         : ${dailyStats.requests}`,
+    `Users Created    : ${dailyStats.usersCreated}`,
+    `Users Updated    : ${dailyStats.usersUpdated}`,
+    `Warranty Extended: ${dailyStats.warrantyExtended}`,
+    `Skipped (no email): ${dailyStats.skipped}`,
+    `Errors           : ${dailyStats.errors}`,
+    `Date: ${date}`,
+    `Host: ${os.hostname()}`
+  ].join('\n');
+  await sendDiscord(msg);
+  resetDailyStats();
+}
+
+function scheduleDailySummary() {
+  const now  = new Date();
+  // Midnight PST (UTC-8) = 08:00 UTC
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 8, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  setTimeout(() => {
+    sendDailySummary().catch(console.error);
+    setInterval(() => sendDailySummary().catch(console.error), 24 * 60 * 60 * 1000);
+  }, next - now);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -20,6 +79,13 @@ function extractField(text, startLabel, endLabel) {
   const regex = new RegExp(`${startLabel}(.*?)${endLabel}`, 's');
   const match = text.match(regex);
   return match ? match[1].trim() : '';
+}
+
+// Outlook-style forwards render mailto:/tel: links as plain text right after
+// the address (e.g. "deborahkroll7@gmail.com<mailto:deborahkroll7@gmail.com>"),
+// which would otherwise get stored/searched with the annotation still attached.
+function stripLinkAnnotation(value) {
+  return (value || '').replace(/<(?:mailto|tel):[^>]*>/gi, '').trim();
 }
 
 function formatDate(dateString) {
@@ -42,7 +108,6 @@ function formatDate(dateString) {
 
 function normalizeProductType(raw) {
   const map = {
-    // "core one pro" must come before "core one" to avoid substring collision
     'core one pro': 'a90',
     'core one':     'a80',
     'beacon':       'dw5a',
@@ -122,46 +187,65 @@ async function zendeskRequest(method, url, data = null, retry = true) {
   }
 }
 
+async function findZendeskUserByEmail(email) {
+  const res = await zendeskRequest('get', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/search.json?query=${encodeURIComponent(email)}`);
+  return res.data.users.length ? res.data.users[0] : null;
+}
+
 // ── Route ──────────────────────────────────────────────────────────────────
 
 app.post('/', async (req, res) => {
+  dailyStats.requests++;
   try {
     const body = req.body;
-    const { requester_id, created_at, ticket_id, subject, description } = body;
+    const { created_at, subject, description = '' } = body;
+    const ticket_id = body.ticket_id ?? body.id;
 
-    // Parse all fields from the concatenated form body
+    if (!ticket_id) {
+      console.error('MISSING_TICKET_ID body:', JSON.stringify(body).slice(0, 500));
+      return res.status(400).json({ error: 'ticket_id missing from payload' });
+    }
+
     const parsed = {
       name:          extractField(description, 'First name', 'Email'),
-      email:         extractField(description, 'Email',      'Phone'),
-      phone:         extractField(description, 'Phone',      'Address'),
+      email:         stripLinkAnnotation(extractField(description, 'Email', 'Phone')),
+      phone:         stripLinkAnnotation(extractField(description, 'Phone', 'Address')),
       address:       extractField(description, 'Address',    'Product'),
       product_type:  extractField(description, 'Product',    'Purchased from'),
       purchased_from:extractField(description, 'Purchased from', 'Purchase date'),
       purchase_date: extractField(description, 'Purchase date',  'Serial number'),
-      // Fixed: was using a hardcoded form artifact that never matched
       serial_number: extractField(description, 'Serial number', 'Please upload')
     };
 
-    // Log any empty fields so we can catch form structure changes early
     const emptyFields = Object.entries(parsed).filter(([,v]) => !v).map(([k]) => k);
     if (emptyFields.length) {
       console.warn(`[ticket ${ticket_id}] Empty fields: ${emptyFields.join(', ')}`);
     }
 
-    const formattedCreatedAt   = formatDate(created_at);
+    // Never trust the payload's requester_id — the ticket always starts out
+    // pointed at the shared Support/info@ceretone.com inbox, so blindly
+    // writing to that id (the old behavior) meant every registration
+    // overwrote the same shared account. Match/create the real customer by
+    // the email parsed out of the form submission instead.
+    if (!parsed.email) {
+      dailyStats.skipped++;
+      console.error(`[ticket ${ticket_id}] No email parsed from registration form — leaving requester unchanged for manual review.`);
+      await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticket_id}.json`, {
+        ticket: { comment: { body: 'No email found in registration form submission, so the requester was not updated. Needs manual review.', public: false } }
+      });
+      return res.json({ message: 'No email parsed - left for manual review.' });
+    }
+
+    const formattedCreatedAt    = formatDate(created_at);
     const formattedPurchaseDate = formatDate(parsed.purchase_date);
 
     if (!formattedPurchaseDate) {
-      console.error(`[ticket ${ticket_id}] Could not parse purchase date: ${repr(parsed.purchase_date)}`);
+      console.error(`[ticket ${ticket_id}] Could not parse purchase date: "${parsed.purchase_date}"`);
     }
 
-    // Fetch existing user to evaluate warranty
-    const userRes      = await zendeskRequest('get', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${requester_id}.json`);
-    const existingUser = userRes.data.user;
-    const existingWarranty = existingUser.user_fields?.warranty_expiration;
+    let user = await findZendeskUserByEmail(parsed.email);
+    const existingWarranty = user?.user_fields?.warranty_expiration;
 
-    // Set warranty to 18 months from purchase, unless they already have
-    // a warranty expiring beyond that (e.g. a purchased extension)
     const eighteenMonthsOut   = new Date(formattedPurchaseDate);
     eighteenMonthsOut.setMonth(eighteenMonthsOut.getMonth() + 18);
     const existingWarrantyDate = existingWarranty ? new Date(existingWarranty) : null;
@@ -171,25 +255,44 @@ app.post('/', async (req, res) => {
         ? eighteenMonthsOut.toISOString().split('T')[0]
         : null;
 
-    // Update user profile
-    await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${requester_id}.json`, {
-      user: {
-        name:  parsed.name,
-        phone: parsed.phone,
-        email: parsed.email,
-        user_fields: {
-          customeraddress:   parsed.address,
-          serial_number:     parsed.serial_number,
-          purchased_from:    normalizePurchasedFrom(parsed.purchased_from, subject),
-          purchase_date:     formattedPurchaseDate,
-          registration_date: formattedCreatedAt,
-          product_type:      normalizeProductType(parsed.product_type),
-          ...(newWarrantyExpiration && { warranty_expiration: newWarrantyExpiration })
+    if (newWarrantyExpiration) dailyStats.warrantyExtended++;
+
+    const userUpdates = {
+      name:  parsed.name,
+      phone: parsed.phone,
+      email: parsed.email,
+      user_fields: {
+        customeraddress:   parsed.address,
+        serial_number:     parsed.serial_number,
+        purchased_from:    normalizePurchasedFrom(parsed.purchased_from, subject),
+        purchase_date:     formattedPurchaseDate,
+        registration_date: formattedCreatedAt,
+        product_type:      normalizeProductType(parsed.product_type),
+        ...(newWarrantyExpiration && { warranty_expiration: newWarrantyExpiration })
+      }
+    };
+
+    if (user) {
+      await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${user.id}.json`, { user: userUpdates });
+      dailyStats.usersUpdated++;
+    } else {
+      try {
+        const created = await zendeskRequest('post', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users.json`, { user: userUpdates });
+        user = created.data.user;
+        dailyStats.usersCreated++;
+      } catch (createErr) {
+        // Concurrent duplicate create (e.g. a retried webhook delivery) — fall back to search + update.
+        if (createErr.response?.status === 409 || createErr.response?.data?.error === 'DatabaseConflict') {
+          user = await findZendeskUserByEmail(parsed.email);
+          if (!user) throw createErr;
+          await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/users/${user.id}.json`, { user: userUpdates });
+          dailyStats.usersUpdated++;
+        } else {
+          throw createErr;
         }
       }
-    });
+    }
 
-    // Solve ticket with internal note
     const commentBody = [
       'Customer details updated:',
       `Ticket ID:          ${ticket_id}`,
@@ -205,6 +308,7 @@ app.post('/', async (req, res) => {
 
     await zendeskRequest('put', `https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${ticket_id}.json`, {
       ticket: {
+        requester_id: user.id,
         status:  'solved',
         comment: { body: commentBody, public: false }
       }
@@ -214,12 +318,26 @@ app.post('/', async (req, res) => {
     return res.json({ message: 'User and ticket updated successfully' });
 
   } catch (err) {
+    dailyStats.errors++;
     const detail = err.response?.data || err.message || String(err);
-    console.error(`[ticket ${req.body?.ticket_id}] ERROR:`, JSON.stringify(detail, null, 2));
+    console.error(`[ticket ${req.body?.ticket_id ?? req.body?.id}] ERROR:`, JSON.stringify(detail, null, 2));
     return res.status(500).json({ error: err.message || 'Unknown error' });
   }
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.listen(PORT, () => console.log(`registration-worker listening on port ${PORT}`));
+// Catch malformed JSON bodies (Zendesk test pings, retries with empty body, etc.)
+app.use((err, req, res, _next) => {
+  if (err.type === 'entity.parse.failed') {
+    console.warn('[bad-request] Malformed JSON body ignored');
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  console.error('[unhandled]', err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+app.listen(PORT, () => {
+  console.log(`registration-worker listening on port ${PORT}`);
+  scheduleDailySummary();
+});

@@ -9,5 +9,5 @@ services:
       - ./data:/app/data
       - ./secrets:/app/secrets
       - ./secrets:/secrets:ro
-    restart: always
+    restart: "no"
 

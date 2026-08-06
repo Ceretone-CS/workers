@@ -16,13 +16,13 @@ SCOPES = [
 ]
 
 
-def get_spreadsheet():
+def get_spreadsheet(spreadsheet_id=None):
     creds = Credentials.from_service_account_file(
         GOOGLE_SERVICE_ACCOUNT_FILE,
         scopes=SCOPES,
     )
     client = gspread.authorize(creds)
-    return client.open_by_key(SPREADSHEET_ID)
+    return client.open_by_key(spreadsheet_id or SPREADSHEET_ID)
 
 
 
@@ -99,6 +99,57 @@ def append_rows(ws, rows):
 def get_existing_ticket_ids(ws):
     values = ws.col_values(1)
     return set(v.strip() for v in values[1:] if v.strip())
+
+
+
+def get_ticket_id_to_row_map(ws):
+    """Returns {ticket_id: row_number} for all data rows (row 2 onward)."""
+    values = ws.col_values(1)
+    return {
+        v.strip(): i
+        for i, v in enumerate(values[1:], start=2)
+        if v.strip()
+    }
+
+
+
+def batch_update_rows(ws, updates):
+    """Update existing rows in place. updates = [(row_number, row_data), ...]"""
+    if not updates:
+        return
+
+    chunk_size = max(1, SHEETS_WRITE_CHUNK_SIZE)
+    for i in range(0, len(updates), chunk_size):
+        update_chunk = updates[i : i + chunk_size]
+        for attempt in range(1, SHEETS_RETRY_COUNT + 1):
+            fresh_chunk = [
+                {
+                    "range": f"A{row_num}:{rowcol_to_a1(row_num, len(row_data))}",
+                    "values": [row_data],
+                }
+                for row_num, row_data in update_chunk
+            ]
+            try:
+                ws.batch_update(fresh_chunk, value_input_option="USER_ENTERED")
+                break
+            except Exception as e:
+                print(
+                    f"Sheets batch update failed attempt {attempt}/{SHEETS_RETRY_COUNT}: {e}",
+                    flush=True,
+                )
+                if attempt < SHEETS_RETRY_COUNT:
+                    if "403" in str(e):
+                        try:
+                            ss = get_spreadsheet(ws.spreadsheet.id)
+                            ws = ss.worksheet(ws.title)
+                            print("Re-authenticated gspread client after 403", flush=True)
+                        except Exception as re_e:
+                            print(f"Re-auth failed: {re_e}", flush=True)
+                    time.sleep(SHEETS_RETRY_SLEEP_SECONDS * attempt)
+                else:
+                    raise RuntimeError(
+                        f"Failed to batch update rows after {SHEETS_RETRY_COUNT} attempts"
+                    ) from e
 
 
 

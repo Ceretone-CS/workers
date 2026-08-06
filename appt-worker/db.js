@@ -21,4 +21,15 @@ db.exec(`
   )
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS calendar_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    type    TEXT NOT NULL CHECK(type IN ('birthday','day_off')),
+    label   TEXT NOT NULL,
+    date    TEXT NOT NULL,
+    annual  INTEGER NOT NULL DEFAULT 0,
+    note    TEXT
+  )
+`);
+
 module.exports = db;

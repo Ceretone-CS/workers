@@ -1,0 +1,16 @@
+services:
+  sheets-metrics-exporter:
+    build: .
+    container_name: sheets-metrics-exporter
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    environment:
+      GOOGLE_SA_JSON: /secrets/shopify-worker-489201-e572ed32f1a3.json
+      SPREADSHEET_ID: 1I1PGvKr6p_syfzx7jZTC1uo3eEYNBu5wgDeHvTzGE-E
+      ORDERS_SHEET: Shopify Orders
+      RETURNS_SHEET: Return Log
+      PORT: "9200"
+      REFRESH_SECS: "1800"
+    volumes:
+      - /home/pwrdbyadobo/docker/workers/shopify-worker/secrets:/secrets:ro

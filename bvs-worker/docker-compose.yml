@@ -1,0 +1,16 @@
+services:
+  bvs-worker:
+    build: .
+    container_name: bvs-worker
+    env_file:
+      - ../.env.common
+      - .env
+    ports:
+      - "3007:3007"
+    restart: always
+    networks:
+      - appt-net
+
+networks:
+  appt-net:
+    external: true

@@ -1,18 +1,10 @@
 services:
   sheets-returns-worker:
     build: .
-    container_name: sheets-returns-worker
     env_file:
       - ../.env.common
       - .env
     volumes:
-      - ./data:/app/data
-    ports:
-      - "3005:3005"
-    restart: always
-    networks:
-      - appt-net
+      - /mnt/dispatcher/workers/sheets-returns/data:/app/data
+    restart: "no"
 
-networks:
-  appt-net:
-    external: true

@@ -1,0 +1,11 @@
+services:
+  return-intent-worker:
+    build: .
+    container_name: return-intent-worker
+    env_file:
+      - ../.env.common
+      - .env
+    volumes:
+      - /mnt/dispatcher/workers/return-intent/data:/app/data
+      - ./service_account.json:/app/service_account.json:ro
+    restart: "no"

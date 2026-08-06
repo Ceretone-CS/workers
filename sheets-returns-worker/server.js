@@ -1,20 +1,15 @@
-const express = require('express');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
-const app = express();
-app.use(express.json());
+const ZENDESK_SUBDOMAIN   = process.env.ZENDESK_SUBDOMAIN || 'audiconcorporation';
+const CLIENT_ID           = process.env.ZENDESK_CLIENT_ID;
+const CLIENT_SECRET       = process.env.ZENDESK_CLIENT_SECRET;
+const SHEET_ID            = process.env.SHEET_ID;
+const STATE_FILE          = path.join(__dirname, 'data', 'processed.json');
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// --- Config ---
-const ZENDESK_SUBDOMAIN = process.env.ZENDESK_SUBDOMAIN || 'audiconcorporation';
-const ZENDESK_API_TOKEN = process.env.ZENDESK_API_TOKEN;
-const ZENDESK_EMAIL     = process.env.ZENDESK_EMAIL || 'ceretonecs@gmail.com';
-const SHEET_ID          = process.env.SHEET_ID;
-const POLL_INTERVAL_MS  = (parseInt(process.env.POLL_INTERVAL_MINUTES) || 60) * 60 * 1000;
-const STATE_FILE        = path.join(__dirname, 'data', 'processed.json');
-
-// --- Zendesk field IDs ---
 const FIELD_RETURN_ACTIVITY  = 31180534996244;
 const FIELD_TRACKING_NUMBER  = 31172376168596;
 const FIELD_ORDER_NUMBER     = 28914817987092;
@@ -29,7 +24,6 @@ const GROUP_ID               = 26266273841300;
 const ASSIGNEE_ID            = 46221339676692;
 const CUSTOM_STATUS_ID       = 25260444955028;
 
-// --- Product map ---
 const PRODUCT_MAP = {
   'A90': 'product__a90', 'CORE ONE PRO': 'product__a90',
   'A80': 'product__a80', 'CORE ONE': 'product__a80',
@@ -39,7 +33,8 @@ const PRODUCT_MAP = {
   'A39': 'product__a39', 'ESSENTIAL': 'product__a39',
   'DW5A': 'product__dw5a', 'BEACON': 'product__dw5a',
   'D12': 'product__d12', 'SOLID': 'product__d12',
-  'D36': 'product__d36', 'NEXUS': 'product__d36', 'EQUATE': 'product__equate__d26', 'JH-D26': 'product__equate__d26', 'D26': 'product__equate__d26',
+  'D36': 'product__d36', 'NEXUS': 'product__d36',
+  'EQUATE': 'product__equate__d26', 'JH-D26': 'product__equate__d26', 'D26': 'product__equate__d26',
 };
 
 function getProductType(raw) {
@@ -79,15 +74,12 @@ function getCondition(raw) {
   if (!raw) return null;
   const u = raw.trim().toUpperCase();
   if (u === 'LIKE NEW' || u === 'LIKE-NEW') return 'returnresult__condition__new';
-  if (u === 'FAIR') return 'returnresult__condition__used';
-  if (u === 'POOR') return 'returnresult__condition__used';
+  if (u === 'FAIR' || u === 'POOR' || u === 'USED') return 'returnresult__condition__used';
   if (u === 'DAMAGED') return 'returnresult__condition__damaged';
   if (u === 'INCOMPLETE') return 'returnresult__condition__missing_components';
-  if (u === 'USED' || u === 'FAIR' || u === 'POOR') return 'returnresult__condition__used';
   return null;
 }
 
-// Case-insensitive column lookup
 function col(row, ...names) {
   for (const name of names) {
     for (const key of Object.keys(row)) {
@@ -97,7 +89,6 @@ function col(row, ...names) {
   return '';
 }
 
-// --- State ---
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -109,7 +100,6 @@ function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// --- HTTP helpers ---
 function httpsRequest(options, body) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
@@ -126,17 +116,54 @@ function httpsRequest(options, body) {
   });
 }
 
-function zdReq(method, zdPath, body) {
-  const auth = Buffer.from(`${ZENDESK_EMAIL}/token:${ZENDESK_API_TOKEN}`).toString('base64');
-  return httpsRequest({
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getToken(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedToken && now < tokenExpiresAt - 60000) return cachedToken;
+  const body = JSON.stringify({
+    grant_type: 'client_credentials',
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    scope: 'read write tickets:write',
+  });
+  const res = await httpsRequest({
     hostname: `${ZENDESK_SUBDOMAIN}.zendesk.com`,
-    path: zdPath,
-    method,
-    headers: {
-      'Authorization': `Basic ${auth}`,
-      'Content-Type': 'application/json',
-    }
-  }, body ? JSON.stringify(body) : undefined);
+    path: '/oauth/tokens',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  }, body);
+  if (res.status !== 200) throw new Error(`OAuth failed: ${JSON.stringify(res.body)}`);
+  cachedToken = res.body.access_token;
+  tokenExpiresAt = now + res.body.expires_in * 1000;
+  return cachedToken;
+}
+
+async function zdReq(method, zdPath, body, retry = true) {
+  const token = await getToken();
+  const payload = body ? JSON.stringify(body) : undefined;
+  const headers = { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
+  if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
+  const res = await httpsRequest({ hostname: `${ZENDESK_SUBDOMAIN}.zendesk.com`, path: zdPath, method, headers }, payload);
+  if (retry && (res.status === 401 || res.status === 403)) {
+    const token2 = await getToken(true);
+    headers['Authorization'] = `Bearer ${token2}`;
+    return httpsRequest({ hostname: `${ZENDESK_SUBDOMAIN}.zendesk.com`, path: zdPath, method, headers }, payload);
+  }
+  return res;
+}
+
+function sendDiscord(msg) {
+  if (!DISCORD_WEBHOOK_URL) return Promise.resolve();
+  const parsed = new URL(DISCORD_WEBHOOK_URL);
+  const body = JSON.stringify({ content: msg });
+  return httpsRequest({
+    hostname: parsed.hostname,
+    path: parsed.pathname + parsed.search,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+  }, body).catch(e => console.error('Discord webhook error:', e.message));
 }
 
 function fetchSheet() {
@@ -145,16 +172,14 @@ function fetchSheet() {
     function follow(u, redirects) {
       if (redirects > 5) return reject(new Error('Too many redirects'));
       const parsed = new URL(u);
-      const opts = {
+      const req = https.request({
         hostname: parsed.hostname,
         path: parsed.pathname + parsed.search,
         method: 'GET',
-        headers: { 'User-Agent': 'sheets-returns-worker/1.0' }
-      };
-      const req = https.request(opts, res => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        headers: { 'User-Agent': 'sheets-returns-worker/1.0' },
+      }, res => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
           return follow(res.headers.location, redirects + 1);
-        }
         let data = '';
         res.on('data', c => data += c);
         res.on('end', () => resolve(data));
@@ -187,25 +212,19 @@ function parseCsv(text) {
 }
 
 async function createTicket(row) {
-  const customerName = col(row, 'Customer Name');
-  const order        = col(row, 'Order Number', 'Order #');
-  const tracking     = col(row, 'Tracking Number', 'Tracking #');
-  const model        = col(row, 'Product', 'Model');
-  const rawSerial    = col(row, 'SERIAL #', 'Serial #', 'Serial Number');
-  const condition    = col(row, 'Condition');
-  const notes        = col(row, 'Test Result Notes', 'Notes', 'Note');
-
-  const serial = extractSerial(rawSerial);
-  const product = getProductType(model);
-  const purchasedFrom = getPurchasedFrom(order);
-  const conditionVal = getCondition(condition);
-  const modelDisplay = model.replace(/\s*\(B\)\s*/gi, '').trim();
-
+  const customerName  = col(row, 'Customer Name');
+  const order         = col(row, 'Order Number', 'Order #');
+  const tracking      = col(row, 'Tracking Number', 'Tracking #');
+  const model         = col(row, 'Product', 'Model');
+  const rawSerial     = col(row, 'SERIAL #', 'Serial #', 'Serial Number');
+  const condition     = col(row, 'Condition');
+  const notes         = col(row, 'Test Result Notes', 'Notes', 'Note');
+  const serial        = extractSerial(rawSerial);
+  const modelDisplay  = model.replace(/\s*\(B\)\s*/gi, '').trim();
   const CHANNEL_NAMES = ['amazon', 'walmart', 'target', 'hsn', 'cardinal health'];
-  const isChannel = CHANNEL_NAMES.includes(customerName.toLowerCase());
+  const isChannel     = CHANNEL_NAMES.includes(customerName.toLowerCase());
   const requesterName = (customerName && !isChannel) ? customerName : 'Returns Department';
-
-  const subject = 'Return Check In: ' + modelDisplay + (serial ? ' - ' + serial : '') + (order ? ' (' + order + ')' : '');
+  const subject       = 'Return Check In: ' + modelDisplay + (serial ? ' - ' + serial : '') + (order ? ' (' + order + ')' : '');
 
   const noteLines = [];
   if (customerName && !isChannel) noteLines.push('<li><strong>Customer:</strong> ' + customerName + '</li>');
@@ -216,122 +235,105 @@ async function createTicket(row) {
   noteLines.push('<li><strong>Condition:</strong> ' + (condition || 'N/A') + '</li>');
   if (notes) noteLines.push('<li><strong>Notes:</strong> ' + notes + '</li>');
 
-  const noteHtml = '<p><strong>Return Check In — Automated Import</strong></p><ul>' + noteLines.join('') + '</ul>';
-
-  // Serial is required by Zendesk form validation when solving — use N/A if missing
-  const serialValue = serial || 'N/A';
-
+  // Only include fields with values — Zendesk rejects solved tickets where required
+  // fields (Order #, Tracking #) are empty or fail the field's regex validation.
   const customFields = [
     { id: FIELD_RETURN_ACTIVITY,  value: 'returnresult__returncheckin' },
-    { id: FIELD_ORDER_NUMBER,     value: order },
-    { id: FIELD_SERIAL_NUMBER,    value: serialValue },
-    { id: FIELD_TRACKING_NUMBER,  value: tracking },
-    { id: FIELD_PURCHASED_FROM,   value: purchasedFrom },
+    { id: FIELD_SERIAL_NUMBER,    value: serial || 'N/A' },
+    { id: FIELD_PURCHASED_FROM,   value: getPurchasedFrom(order) },
+    { id: FIELD_PRODUCT_TYPE,     value: getProductType(model) || 'product__general' },
+    { id: FIELD_RETURN_CONDITION, value: getCondition(condition) || 'returnresult__condition__used' },
   ];
-  customFields.push({ id: FIELD_PRODUCT_TYPE, value: product || 'product__general' });
-  customFields.push({ id: FIELD_RETURN_CONDITION, value: conditionVal || 'returnresult__condition__used' });
-  if (notes) customFields.push({ id: FIELD_NOTES, value: notes });
+  customFields.push({ id: FIELD_ORDER_NUMBER,    value: order || 'N/A' });
+  customFields.push({ id: FIELD_TRACKING_NUMBER, value: tracking || 'N/A' });
+  if (notes)    customFields.push({ id: FIELD_NOTES,           value: notes });
 
-  const payload = {
-    ticket: {
-      subject,
-      requester: { name: requesterName, email: 'returns@ceretone.com' },
-      brand_id: BRAND_ID,
-      group_id: GROUP_ID,
-      assignee_id: ASSIGNEE_ID,
-      ticket_form_id: FORM_ID,
-      custom_status_id: CUSTOM_STATUS_ID,
-      status: 'solved',
-      comment: { html_body: noteHtml, public: false },
-      custom_fields: customFields,
-    }
+  const ticketBody = {
+    subject,
+    requester: { name: requesterName, email: 'returns@ceretone.com' },
+    brand_id: BRAND_ID, group_id: GROUP_ID, assignee_id: ASSIGNEE_ID,
+    ticket_form_id: FORM_ID, custom_status_id: CUSTOM_STATUS_ID, status: 'solved',
+    comment: { html_body: '<p><strong>Return Check In — Automated Import</strong></p><ul>' + noteLines.join('') + '</ul>', public: false },
+    custom_fields: customFields,
   };
 
-  return zdReq('POST', '/api/v2/tickets.json', payload);
+  const res = await zdReq('POST', '/api/v2/tickets.json', { ticket: ticketBody });
+
+  // 422 means a required-to-solve field failed validation (e.g. Order # regex mismatch,
+  // missing Tracking #). Retry as open so the ticket is at least created for manual review.
+  if (res.status === 422) {
+    console.warn('  422 on solve — retrying as open for [' + (order || serial) + ']');
+    const fallback = Object.assign({}, ticketBody, { status: 'open', custom_status_id: undefined });
+    return zdReq('POST', '/api/v2/tickets.json', { ticket: fallback });
+  }
+
+  return res;
 }
 
-// --- Stats ---
-const stats = { lastRun: null, lastRunRows: 0, lastRunCreated: 0, lastRunSkipped: 0, lastRunErrors: 0, totalCreated: 0 };
-let running = false;
-
-async function runPoll() {
-  if (running) { console.log('Poll already running, skipping.'); return; }
-  running = true;
-  console.log('[' + new Date().toISOString() + '] Starting poll run...');
-  stats.lastRun = new Date().toISOString();
-  stats.lastRunRows = 0;
-  stats.lastRunCreated = 0;
-  stats.lastRunSkipped = 0;
-  stats.lastRunErrors = 0;
+async function main() {
+  console.log('[' + new Date().toISOString() + '] Starting returns poll...');
+  const created = { count: 0 };
+  let skipped = 0, errors = 0;
+  const errorDetails = [];
 
   let csv;
-  try {
-    csv = await fetchSheet();
-  } catch (e) {
+  try { csv = await fetchSheet(); }
+  catch (e) {
     console.error('Failed to fetch sheet:', e.message);
-    running = false;
-    return;
+    await sendDiscord('❌ RETURNS POLL FAILED\n\nFailed to fetch sheet: ' + e.message + '\nHost: ' + os.hostname());
+    process.exit(1);
   }
 
   const rows = parseCsv(csv);
-  stats.lastRunRows = rows.length;
   const state = loadState();
 
   for (const row of rows) {
     const order  = col(row, 'Order Number', 'Order #');
     const serial = extractSerial(col(row, 'SERIAL #', 'Serial #', 'Serial Number'));
-    if (!order && !serial) { stats.lastRunSkipped++; continue; }
-
+    if (!order && !serial) { skipped++; continue; }
     const key = order + '||' + serial;
-    if (state.processed[key]) { stats.lastRunSkipped++; continue; }
-
+    if (state.processed[key]) { skipped++; continue; }
     try {
       const res = await createTicket(row);
       if (res.status === 201) {
         const ticketId = res.body.ticket && res.body.ticket.id;
         console.log('  Created ticket #' + ticketId + ' for [' + key + ']');
         state.processed[key] = { ticketId, createdAt: new Date().toISOString() };
-        stats.lastRunCreated++;
-        stats.totalCreated++;
+        created.count++;
         saveState(state);
       } else {
+        const reason = res.body?.details?.base?.[0]?.description || res.body?.description || res.status;
         console.error('  Error ' + res.status + ' for [' + key + ']:', JSON.stringify(res.body).slice(0, 300));
-        stats.lastRunErrors++;
+        errorDetails.push('[' + key + '] ' + reason);
+        errors++;
       }
     } catch (e) {
       console.error('  Exception for [' + key + ']:', e.message);
-      stats.lastRunErrors++;
+      errorDetails.push('[' + key + '] ' + e.message);
+      errors++;
     }
-
     await new Promise(r => setTimeout(r, 1100));
   }
 
-  console.log('[' + new Date().toISOString() + '] Done. Created: ' + stats.lastRunCreated + ', Skipped: ' + stats.lastRunSkipped + ', Errors: ' + stats.lastRunErrors);
-  running = false;
+  const icon = errors > 0 ? '❌' : '✅';
+  const totalKeys = Object.keys(state.processed).length;
+  const now = new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour12: false }).replace(',', '');
+  const lines = [
+    icon + ' RETURNS POLL ' + (errors > 0 ? 'ERRORS' : 'OK'), '',
+    'Rows Seen    : ' + rows.length,
+    'Created      : ' + created.count,
+    'Skipped      : ' + skipped,
+    'Errors       : ' + errors,
+    'Total Created: ' + totalKeys,
+  ];
+  if (errorDetails.length) lines.push('', ...errorDetails.map(e => '⚠️ ' + e));
+  lines.push('Host: ' + os.hostname(), 'Time: ' + now);
+  await sendDiscord(lines.join('\n'));
+  console.log('[' + new Date().toISOString() + '] Done. Created: ' + created.count + ', Skipped: ' + skipped + ', Errors: ' + errors);
 }
 
-// --- Routes ---
-app.post('/run', async (req, res) => {
-  res.json({ message: running ? 'Already running' : 'Poll triggered', timestamp: new Date().toISOString() });
-  if (!running) runPoll().catch(console.error);
-});
-
-app.get('/status', (req, res) => {
-  const state = loadState();
-  res.json({
-    status: 'ok',
-    running,
-    stats,
-    totalProcessedKeys: Object.keys(state.processed).length,
-    pollIntervalMinutes: POLL_INTERVAL_MS / 60000,
-    sheetId: SHEET_ID,
-  });
-});
-
-// --- Start ---
-const PORT = process.env.PORT || 3005;
-app.listen(PORT, () => {
-  console.log('sheets-returns-worker listening on port ' + PORT);
-  runPoll().catch(console.error);
-  setInterval(() => runPoll().catch(console.error), POLL_INTERVAL_MS);
+main().catch(async e => {
+  console.error('Fatal:', e.message);
+  await sendDiscord('❌ RETURNS POLL FAILED\n\n' + e.message + '\nHost: ' + os.hostname());
+  process.exit(1);
 });

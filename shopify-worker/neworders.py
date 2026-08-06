@@ -13,6 +13,7 @@ SHOPIFY_TOKEN = os.environ["SHOPIFY_TOKEN"]
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 SHEET_ID = os.environ["SHEET_ID"]
+SHEET_ID_2 = os.environ.get("SHEET_ID_2", "")
 SHEET_NAME = os.environ.get("SHEET_NAME", "Shopify Orders3")
 GOOGLE_SA_JSON = os.environ["GOOGLE_SA_JSON"]
 
@@ -132,9 +133,9 @@ def get_page_info(next_url: str):
     m = re.search(r"[?&]page_info=([^&]+)", next_url)
     return m.group(1) if m else ""
 
-def get_last_row(svc) -> int:
+def get_last_row(svc, sheet_id=None) -> int:
     resp = svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=sheet_id or SHEET_ID,
         range=f"{SHEET_NAME}!A:A",
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
@@ -166,12 +167,13 @@ def get_last_id_and_date(svc):
     last_dt = to_dt(last_date_raw)
     return last_id, last_dt, last_row
 
-def read_existing_ids_tail(svc, tail_rows: int = 3000) -> set[int]:
-    last_row = get_last_row(svc)
+def read_existing_ids_tail(svc, tail_rows: int = 3000, sheet_id=None) -> set[int]:
+    sid = sheet_id or SHEET_ID
+    last_row = get_last_row(svc, sid)
     start = max(2, last_row - tail_rows + 1)
     rng = f"{SHEET_NAME}!A{start}:A{last_row}"
     resp = svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=sid,
         range=rng,
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
@@ -185,11 +187,11 @@ def read_existing_ids_tail(svc, tail_rows: int = 3000) -> set[int]:
             pass
     return ids
 
-def append_rows(svc, rows: list[list[str]]):
+def append_rows(svc, rows: list[list[str]], sheet_id=None):
     if not rows:
         return 0
     resp = svc.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
+        spreadsheetId=sheet_id or SHEET_ID,
         range=f"{SHEET_NAME}!A:A",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
@@ -198,15 +200,16 @@ def append_rows(svc, rows: list[list[str]]):
     updates = resp.get("updates", {})
     return updates.get("updatedRows", 0)
 
-def ensure_header(svc):
+def ensure_header(svc, sheet_id=None):
+    sid = sheet_id or SHEET_ID
     resp = svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range=f"{SHEET_NAME}!A1:L1",
+        spreadsheetId=sid, range=f"{SHEET_NAME}!A1:L1",
         valueRenderOption="UNFORMATTED_VALUE"
     ).execute()
     vals = resp.get("values", [])
     if not vals or not any(vals[0]):
         svc.spreadsheets().values().update(
-            spreadsheetId=SHEET_ID,
+            spreadsheetId=sid,
             range=f"{SHEET_NAME}!A1:L1",
             valueInputOption="RAW",
             body={"values": [HEADERS]},
@@ -215,6 +218,8 @@ def ensure_header(svc):
 def main():
     svc = sheets_service()
     ensure_header(svc)
+    if SHEET_ID_2:
+        ensure_header(svc, SHEET_ID_2)
     max_created_at_seen = None
 
     last_id, last_dt, last_row = get_last_id_and_date(svc)
@@ -233,6 +238,8 @@ def main():
 
     tail = 5000 if state.get("last_created_at") else 30000
     existing_ids = read_existing_ids_tail(svc, tail_rows=tail)
+    if SHEET_ID_2:
+        existing_ids |= read_existing_ids_tail(svc, tail_rows=tail, sheet_id=SHEET_ID_2)
     seen_this_run = set()
 
     page_info = None
@@ -319,6 +326,8 @@ def main():
     for i in range(0, len(new_rows), WRITE_CHUNK):
         chunk = new_rows[i:i+WRITE_CHUNK]
         appended += append_rows(svc, chunk)
+        if SHEET_ID_2:
+            append_rows(svc, chunk, SHEET_ID_2)
         time.sleep(0.15)
 
     last_row_written = last_row + appended if appended else last_row

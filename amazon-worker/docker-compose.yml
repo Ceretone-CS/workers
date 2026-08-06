@@ -1,0 +1,10 @@
+services:
+  amazon-worker:
+    build: .
+    container_name: amazon-worker
+    env_file:
+      - ../.env.common
+      - .env
+    volumes:
+      - /mnt/dispatcher/workers/amazon:/app/data
+    restart: always

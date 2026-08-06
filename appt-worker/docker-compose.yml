@@ -4,7 +4,7 @@ services:
     container_name: appt-worker
     env_file: .env
     volumes:
-      - ./data:/app/data
+      - /mnt/dispatcher/workers/appt/data:/app/data
     restart: always
     networks:
       - appt-net

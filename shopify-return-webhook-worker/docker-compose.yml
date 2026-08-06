@@ -1,0 +1,16 @@
+services:
+  shopify-return-webhook-worker:
+    build: .
+    container_name: shopify-return-webhook-worker
+    env_file:
+      - ../.env.common
+      - .env
+    ports:
+      - "3006:3006"
+    restart: always
+    networks:
+      - appt-net
+
+networks:
+  appt-net:
+    external: true

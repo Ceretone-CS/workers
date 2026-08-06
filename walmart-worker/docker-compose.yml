@@ -1,0 +1,14 @@
+services:
+  walmart-worker:
+    build: .
+    container_name: walmart-worker
+    working_dir: /app
+    env_file:
+      - ../.env.common
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./app:/app/app
+      - /mnt/dispatcher/workers/walmart/data:/app/data
+    restart: always

@@ -5,6 +5,9 @@ services:
     env_file:
       - ../.env.common
       - .env
+    volumes:
+      - ./credentials:/app/credentials:ro
+      - ./data:/app/data
     ports:
       - "3004:3004"
     restart: always
