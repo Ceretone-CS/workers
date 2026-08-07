@@ -309,9 +309,10 @@ function loadDeliveryState() {
     const s = JSON.parse(fs.readFileSync(DELIVERY_STATE_FILE, 'utf8'));
     if (!Array.isArray(s.created_order_ids)) s.created_order_ids = [];
     if (typeof s.pending !== 'object' || s.pending === null || Array.isArray(s.pending)) s.pending = {};
+    if (!Number.isInteger(s.next_agent_index)) s.next_agent_index = 0;
     return s;
   } catch (e) {
-    return { created_order_ids: [], pending: {} };
+    return { created_order_ids: [], pending: {}, next_agent_index: 0 };
   }
 }
 
@@ -320,14 +321,19 @@ function saveDeliveryState(state) {
   fs.writeFileSync(DELIVERY_STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-function pickRandomAgent() {
+// Cycles through DELIVERY_AGENT_IDS in order, persisting the cursor in the
+// state file so distribution stays fair across restarts and across the two
+// createDeliveryTicket call sites (main batch pass + pending re-check pass).
+function pickNextAgent(state) {
   if (!DELIVERY_AGENT_IDS.length) return undefined;
-  return DELIVERY_AGENT_IDS[Math.floor(Math.random() * DELIVERY_AGENT_IDS.length)];
+  const index = state.next_agent_index % DELIVERY_AGENT_IDS.length;
+  state.next_agent_index = (index + 1) % DELIVERY_AGENT_IDS.length;
+  return DELIVERY_AGENT_IDS[index];
 }
 
 // Creates a delivery ticket. If the customer has an email, sends the welcome message.
 // If phone-only, creates an internal call reminder for the assigned agent. Skips if neither.
-async function createDeliveryTicket(order, fulfillment, deliveryDate) {
+async function createDeliveryTicket(order, fulfillment, deliveryDate, deliveryState) {
   const email = order.email || (order.customer && order.customer.email);
   const phone = order.phone
     || (order.customer && order.customer.phone)
@@ -341,7 +347,7 @@ async function createDeliveryTicket(order, fulfillment, deliveryDate) {
   const customerName = [order.customer && order.customer.first_name, order.customer && order.customer.last_name]
     .filter(Boolean).join(' ').trim();
   const firstName = (order.customer && order.customer.first_name) || customerName.split(' ')[0] || 'there';
-  const assigneeId = pickRandomAgent();
+  const assigneeId = pickNextAgent(deliveryState);
   const agentName = AGENT_NAMES[assigneeId] || 'Ceretone Customer Support';
   const copItem = (order.line_items || []).find(li => isCoreOnePro(li.title));
   const productTitle = (copItem || (order.line_items && order.line_items[0]) || {}).title || 'n/a';
@@ -611,7 +617,7 @@ app.post('/sync', async (req, res) => {
 
     if (f.shipment_status === 'delivered' && isHearingAid && !isKnockingOrder && !deliveryCreatedSet.has(orderId)) {
       try {
-        const result = await createDeliveryTicket(order, f, deliveryDate);
+        const result = await createDeliveryTicket(order, f, deliveryDate, deliveryState);
         if (result && !result.dry_run) {
           deliveryCreatedSet.add(orderId);
           delete deliveryState.pending[orderId];
@@ -707,7 +713,7 @@ app.post('/sync', async (req, res) => {
     if (isKnockingOrder) { delete deliveryState.pending[orderId]; continue; }
 
     try {
-      const result = await createDeliveryTicket(order, f, deliveryDate);
+      const result = await createDeliveryTicket(order, f, deliveryDate, deliveryState);
       if (result && !result.dry_run) {
         deliveryCreatedSet.add(orderId);
         delete deliveryState.pending[orderId];
