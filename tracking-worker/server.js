@@ -759,6 +759,12 @@ app.post('/sync', async (req, res) => {
     },
     dry_run:                  DRY_RUN,
     dry_run_would_create:     deliveryResults,
+    // Same detail the Discord report gets, so a bad run is debuggable from
+    // sync-cron.log even if the Discord message scrolled by or the container
+    // that produced it has since been recreated.
+    created_tickets:          createdLines,
+    failed_tickets:           failedLines,
+    dropped_stale_orders:     droppedLines,
   };
 
   // ── Single consolidated Discord report for the whole run ───────────────────
