@@ -75,8 +75,19 @@ Ceretone Customer Support`;
 
 const dailyStats = { requests: 0, fulfillmentsFound: 0, notFound: 0, errors: 0, deliveryTickets: 0 };
 
+// Discord message content is capped at 2000 chars — a run with a long failed/
+// created list (each line can be a full Zendesk error blob) can exceed that
+// and get rejected with a 400, which sendDiscord previously only console.error'd,
+// so the report silently never arrived. Truncate defensively so the summary
+// numbers at the top (which fit easily) always get through.
+const DISCORD_MSG_LIMIT = 2000;
+
 async function sendDiscord(msg) {
   if (!DISCORD_WEBHOOK_URL) return;
+  if (msg.length > DISCORD_MSG_LIMIT) {
+    const suffix = '\n…(truncated — see sync-cron.log for full detail)';
+    msg = msg.slice(0, DISCORD_MSG_LIMIT - suffix.length) + suffix;
+  }
   try {
     await axios.post(DISCORD_WEBHOOK_URL, { content: msg });
   } catch (e) {
@@ -403,10 +414,17 @@ async function createDeliveryTicket(order, fulfillment, deliveryDate, deliverySt
       ...orderDetails,
     ];
 
+    // Zendesk rejects a real support/agent address as a requester, so this can't
+    // be a fixed placeholder like support@ceretone.com (that address is already
+    // registered as a support address — every phone-only ticket failed with
+    // RecordInvalid until this was made a unique per-order placeholder instead).
+    // It's never delivered to since this ticket is internal-only (public: false).
+    const placeholderEmail = `phone-only-${order.id}@no-reply.ceretone.internal`;
+
     const ticketPayload = {
       ticket: {
         subject,
-        requester: { name: customerName || 'Phone-Only Customer', email: 'support@ceretone.com' },
+        requester: { name: customerName || 'Phone-Only Customer', email: placeholderEmail },
         comment: { body: noteLines.join('\n'), public: false },
         assignee_id: assigneeId,
         ticket_form_id: 50435782665492,
