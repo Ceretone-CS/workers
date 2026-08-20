@@ -117,3 +117,44 @@ def get_user(user_id):
 
 def list_ticket_fields():
     return _get(f'{BASE_URL}/ticket_fields').get('ticket_fields', [])
+
+
+def _write(method, url, json_body=None):
+    while True:
+        r = requests.request(method, url, headers=_headers(), json=json_body, timeout=60)
+        if r.status_code == 429:
+            retry_after = int(r.headers.get('Retry-After', '10'))
+            print(f'Rate limited. Sleeping for {retry_after + 1}s')
+            time.sleep(retry_after + 1)
+            continue
+        if r.status_code == 401:
+            get_access_token(force_refresh=True)
+            r = requests.request(method, url, headers=_headers(), json=json_body, timeout=60)
+            if r.status_code == 401:
+                raise RuntimeError(f'Zendesk auth failed after token refresh. Response: {r.text}')
+        r.raise_for_status()
+        time.sleep(REQUEST_SLEEP_SECONDS)
+        return r.json() if r.text else {}
+
+
+def update_user_fields(user_id, fields):
+    return _write('PUT', f'{BASE_URL}/users/{user_id}.json', {'user': {'user_fields': fields}})
+
+
+def add_user_tags(user_id, tags):
+    return _write('PUT', f'{BASE_URL}/users/{user_id}/tags.json', {'tags': tags})
+
+
+def remove_user_tags(user_id, tags):
+    return _write('DELETE', f'{BASE_URL}/users/{user_id}/tags.json', {'tags': tags})
+
+
+def search_users_by_tag(tag):
+    url = f'{BASE_URL}/search.json'
+    params = {'query': f'type:user tags:{tag}'}
+    while url:
+        data = _get(url, params=params)
+        params = None
+        for result in data.get('results', []):
+            yield result
+        url = data.get('next_page') or None

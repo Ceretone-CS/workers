@@ -27,6 +27,7 @@ from app.config import (
     SPREADSHEET_ID_2,
 )
 from app.utils.state import get_resume_state, start_run, checkpoint_run, complete_run
+from app.survey_suppression import record_survey_if_tagged
 
 
 def get_custom_fields_map(ticket):
@@ -242,6 +243,7 @@ def run_ticket_sync(mode="backfill"):
 
     for ticket in iter_incremental_tickets(start_time):
         scanned += 1
+        record_survey_if_tagged(ticket)
         ticket_id = str(ticket.get("id", ""))
         generated_timestamp = ticket.get("generated_timestamp")
         if generated_timestamp is not None and (

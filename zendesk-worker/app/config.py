@@ -49,3 +49,11 @@ def validate_config():
     if missing:
         raise RuntimeError(f'Missing required env vars: {chr(44).join(missing)}')
 SPREADSHEET_ID_2 = os.getenv("SPREADSHEET_ID_2", "").strip()
+
+SURVEY_TRIGGER_TAGS = {
+    t.strip() for t in os.getenv('SURVEY_TRIGGER_TAGS', 'survey__nps,survey__csat').split(',')
+    if t.strip()
+}
+SURVEY_SUPPRESSION_TAG = os.getenv('SURVEY_SUPPRESSION_TAG', 'survey_recently_sent').strip()
+SURVEY_LAST_SENT_FIELD_KEY = os.getenv('SURVEY_LAST_SENT_FIELD_KEY', 'last_survey_sent').strip()
+SURVEY_SUPPRESSION_DAYS = int(os.getenv('SURVEY_SUPPRESSION_DAYS', '30'))
