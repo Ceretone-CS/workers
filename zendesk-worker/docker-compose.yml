@@ -4,6 +4,7 @@ services:
     container_name: zendesk-worker
     working_dir: /app
     env_file:
+      - ../.env.common
       - .env
     environment:
       - PYTHONUNBUFFERED=1

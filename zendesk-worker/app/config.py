@@ -54,6 +54,13 @@ SURVEY_TRIGGER_TAGS = {
     t.strip() for t in os.getenv('SURVEY_TRIGGER_TAGS', 'survey__nps,survey__csat').split(',')
     if t.strip()
 }
-SURVEY_SUPPRESSION_TAG = os.getenv('SURVEY_SUPPRESSION_TAG', 'survey_recently_sent').strip()
 SURVEY_LAST_SENT_FIELD_KEY = os.getenv('SURVEY_LAST_SENT_FIELD_KEY', 'last_survey_sent').strip()
 SURVEY_SUPPRESSION_DAYS = int(os.getenv('SURVEY_SUPPRESSION_DAYS', '30'))
+
+# CSAT only for now - NPS Survey (44065561366932) has a pre-existing "any"
+# condition group that needs manual review before its cutoff can be
+# safely auto-refreshed here. See docker/workers/zendesk-worker notes.
+SURVEY_AUTOMATION_IDS = [
+    a.strip() for a in os.getenv('SURVEY_AUTOMATION_IDS', '36381838476948').split(',')
+    if a.strip()
+]

@@ -141,20 +141,13 @@ def update_user_fields(user_id, fields):
     return _write('PUT', f'{BASE_URL}/users/{user_id}.json', {'user': {'user_fields': fields}})
 
 
-def add_user_tags(user_id, tags):
-    return _write('PUT', f'{BASE_URL}/users/{user_id}/tags.json', {'tags': tags})
+def get_automation(automation_id):
+    return _get(f'{BASE_URL}/automations/{automation_id}.json').get('automation', {})
 
 
-def remove_user_tags(user_id, tags):
-    return _write('DELETE', f'{BASE_URL}/users/{user_id}/tags.json', {'tags': tags})
-
-
-def search_users_by_tag(tag):
-    url = f'{BASE_URL}/search.json'
-    params = {'query': f'type:user tags:{tag}'}
-    while url:
-        data = _get(url, params=params)
-        params = None
-        for result in data.get('results', []):
-            yield result
-        url = data.get('next_page') or None
+def update_automation_conditions(automation_id, conditions, actions):
+    return _write(
+        'PUT',
+        f'{BASE_URL}/automations/{automation_id}.json',
+        {'automation': {'conditions': conditions, 'actions': actions}},
+    )

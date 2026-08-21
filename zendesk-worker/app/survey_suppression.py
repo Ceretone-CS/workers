@@ -1,17 +1,16 @@
-from datetime import datetime, timedelta, date
+from datetime import date, timedelta
 
 from app.config import (
     SURVEY_TRIGGER_TAGS,
-    SURVEY_SUPPRESSION_TAG,
     SURVEY_LAST_SENT_FIELD_KEY,
     SURVEY_SUPPRESSION_DAYS,
+    SURVEY_AUTOMATION_IDS,
 )
 from app.zendesk_api import (
     get_user,
     update_user_fields,
-    add_user_tags,
-    remove_user_tags,
-    search_users_by_tag,
+    get_automation,
+    update_automation_conditions,
 )
 
 
@@ -39,8 +38,6 @@ def record_survey_if_tagged(ticket):
         return
 
     update_user_fields(requester_id, {SURVEY_LAST_SENT_FIELD_KEY: today})
-    if SURVEY_SUPPRESSION_TAG not in (user.get('tags') or []):
-        add_user_tags(requester_id, [SURVEY_SUPPRESSION_TAG])
     print(
         f'Recorded survey suppression for requester {requester_id} '
         f'(last_survey_sent={today})',
@@ -48,13 +45,36 @@ def record_survey_if_tagged(ticket):
     )
 
 
-def sweep_expired_suppressions():
-    cutoff = (datetime.utcnow().date() - timedelta(days=SURVEY_SUPPRESSION_DAYS)).isoformat()
-    expired = 0
-    for user in search_users_by_tag(SURVEY_SUPPRESSION_TAG):
-        last_sent = (user.get('user_fields') or {}).get(SURVEY_LAST_SENT_FIELD_KEY)
-        if not last_sent or last_sent <= cutoff:
-            remove_user_tags(user['id'], [SURVEY_SUPPRESSION_TAG])
-            expired += 1
-    if expired:
-        print(f'Swept {expired} expired survey suppression tag(s).', flush=True)
+def refresh_survey_cutoff_conditions():
+    """Keep each watched automation's cooldown cutoff date current.
+
+    Each automation has an "any" condition pair on
+    requester.custom_fields.last_survey_sent: not_present (never surveyed)
+    OR less_than_equal <cutoff> (surveyed long enough ago). The cutoff has
+    to be an absolute date, so it's refreshed here daily rather than using
+    a relative operator Zendesk doesn't offer for this comparison.
+    """
+    cutoff = (date.today() - timedelta(days=SURVEY_SUPPRESSION_DAYS)).isoformat()
+    field = f'requester.custom_fields.{SURVEY_LAST_SENT_FIELD_KEY}'
+
+    for automation_id in SURVEY_AUTOMATION_IDS:
+        automation = get_automation(automation_id)
+        if not automation:
+            print(f'Automation {automation_id} not found, skipping cutoff refresh.', flush=True)
+            continue
+
+        any_conditions = list(automation['conditions'].get('any', []))
+        changed = False
+        for c in any_conditions:
+            if c.get('field') == field and c.get('operator') == 'less_than_equal':
+                if c.get('value') != cutoff:
+                    c['value'] = cutoff
+                    changed = True
+
+        if changed:
+            update_automation_conditions(
+                automation_id,
+                {'all': automation['conditions']['all'], 'any': any_conditions},
+                automation['actions'],
+            )
+            print(f'Refreshed survey cutoff for automation {automation_id} to {cutoff}.', flush=True)
