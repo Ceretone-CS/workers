@@ -2,8 +2,8 @@
 """
 Return Intent Worker - runs daily at 3am
 Finds Zendesk tickets where a customer mentions return intent in their first 2
-inbound messages, cross-references with Shopify Core One Pro orders, and writes
-results to the "Return Intent" sheet in Google Sheets.
+inbound messages, cross-references with Shopify orders for tracked products
+(Core One Pro, Beacon), and writes results to each product's own sheet tab.
 """
 
 import json, os, re, time
@@ -63,6 +63,12 @@ RETURN_RE = re.compile(
     re.IGNORECASE,
 )
 CORE_ONE_PRO_RE = re.compile(r'core[\s\-]*one[\s\-]*pro', re.IGNORECASE)
+BEACON_RE       = re.compile(r'\bbeacon\b', re.IGNORECASE)
+
+PRODUCTS = [
+    {"name": "Core One Pro", "regex": CORE_ONE_PRO_RE, "worksheet": "Return Intent - A90"},
+    {"name": "Beacon",       "regex": BEACON_RE,        "worksheet": "Return Intent - DW5A"},
+]
 
 HEADERS = [
     "Ticket ID", "Ticket Created (UTC)", "Customer Email",
@@ -105,19 +111,19 @@ def sheets_service():
     )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-def ensure_worksheet(svc, sheet_id=None):
+def ensure_worksheet(svc, sheet_id=None, worksheet=WORKSHEET_NAME):
     sid = sheet_id or SPREADSHEET_ID
     meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
     for s in meta.get("sheets", []):
-        if s["properties"]["title"] == WORKSHEET_NAME:
+        if s["properties"]["title"] == worksheet:
             return
-    body = {"requests": [{"addSheet": {"properties": {"title": WORKSHEET_NAME}}}]}
+    body = {"requests": [{"addSheet": {"properties": {"title": worksheet}}}]}
     svc.spreadsheets().batchUpdate(spreadsheetId=sid, body=body).execute()
-    print(f"[Sheets] Created worksheet '{WORKSHEET_NAME}' in {sid}.")
+    print(f"[Sheets] Created worksheet '{worksheet}' in {sid}.")
 
-def ensure_headers(svc, sheet_id=None):
+def ensure_headers(svc, sheet_id=None, worksheet=WORKSHEET_NAME):
     sid = sheet_id or SPREADSHEET_ID
-    rng = f"{WORKSHEET_NAME}!A1:H1"
+    rng = f"{worksheet}!A1:H1"
     result = svc.spreadsheets().values().get(
         spreadsheetId=sid, range=rng
     ).execute()
@@ -127,33 +133,33 @@ def ensure_headers(svc, sheet_id=None):
             valueInputOption="RAW", body={"values": [HEADERS]},
         ).execute()
 
-def get_existing_ticket_ids(svc, sheet_id=None):
+def get_existing_ticket_ids(svc, sheet_id=None, worksheet=WORKSHEET_NAME):
     sid = sheet_id or SPREADSHEET_ID
     result = svc.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"{WORKSHEET_NAME}!A2:A",
+        spreadsheetId=sid, range=f"{worksheet}!A2:A",
     ).execute()
     return {str(r[0]) for r in result.get("values", []) if r}
 
-def get_existing_emails(svc, sheet_id=None):
+def get_existing_emails(svc, sheet_id=None, worksheet=WORKSHEET_NAME):
     """Return lowercase set of customer emails already recorded in the sheet."""
     sid = sheet_id or SPREADSHEET_ID
     result = svc.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"{WORKSHEET_NAME}!C2:C",
+        spreadsheetId=sid, range=f"{worksheet}!C2:C",
     ).execute()
     return {str(r[0]).lower() for r in result.get("values", []) if r}
 
-def append_rows(svc, rows, sheet_id=None):
+def append_rows(svc, rows, sheet_id=None, worksheet=WORKSHEET_NAME):
     if not rows:
         return
     sid = sheet_id or SPREADSHEET_ID
     svc.spreadsheets().values().append(
         spreadsheetId=sid,
-        range=f"{WORKSHEET_NAME}!A1",
+        range=f"{worksheet}!A1",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
     ).execute()
-    print(f"[Sheets] Appended {len(rows)} rows to {sid}.")
+    print(f"[Sheets] Appended {len(rows)} rows to '{worksheet}' in {sid}.")
 
 # ─── Zendesk ──────────────────────────────────────────────────────────────────
 
@@ -247,12 +253,15 @@ def shopify_get(endpoint, params=None):
         time.sleep(SHOPIFY_SLEEP)
         return r.json()
 
-def is_core_one_pro(order):
+def classify_order(order):
+    """Return the matching PRODUCTS entry for this order's line items, else None."""
     for item in order.get("line_items", []):
-        if CORE_ONE_PRO_RE.search(item.get("title") or "") or \
-           CORE_ONE_PRO_RE.search(item.get("variant_title") or ""):
-            return True
-    return False
+        title   = item.get("title") or ""
+        variant = item.get("variant_title") or ""
+        for product in PRODUCTS:
+            if product["regex"].search(title) or product["regex"].search(variant):
+                return product
+    return None
 
 def order_by_number(order_number):
     clean = str(order_number).lstrip("#").strip()
@@ -260,7 +269,7 @@ def order_by_number(order_number):
         "name": f"#{clean}", "status": "any", "fields": FIELDS,
     })
     for o in data.get("orders", []):
-        if is_core_one_pro(o):
+        if classify_order(o):
             return o
     return None
 
@@ -270,7 +279,7 @@ def order_by_email(email):
     })
     orders = sorted(data.get("orders", []), key=lambda o: o.get("created_at", ""), reverse=True)
     for o in orders:
-        if is_core_one_pro(o):
+        if classify_order(o):
             return o
     return None
 
@@ -296,19 +305,24 @@ def main():
     print(f"[Main] Processing tickets created after {start_str}")
 
     svc = sheets_service()
-    ensure_worksheet(svc)
-    ensure_headers(svc)
-    existing_ids    = get_existing_ticket_ids(svc)
-    existing_emails = get_existing_emails(svc)
-    if SPREADSHEET_ID_2:
-        ensure_worksheet(svc, SPREADSHEET_ID_2)
-        ensure_headers(svc, SPREADSHEET_ID_2)
-        existing_ids    |= get_existing_ticket_ids(svc, SPREADSHEET_ID_2)
-        existing_emails |= get_existing_emails(svc, SPREADSHEET_ID_2)
-    print(f"[Sheets] {len(existing_ids)} existing ticket IDs, {len(existing_emails)} existing customer emails across sheet(s).")
+    existing_ids = set()
+    # product_state[name] = {"existing_emails": set(), "candidates": {email: (created_at_str, row)}}
+    product_state = {}
+    for product in PRODUCTS:
+        ws = product["worksheet"]
+        ensure_worksheet(svc, worksheet=ws)
+        ensure_headers(svc, worksheet=ws)
+        ids    = get_existing_ticket_ids(svc, worksheet=ws)
+        emails = get_existing_emails(svc, worksheet=ws)
+        if SPREADSHEET_ID_2:
+            ensure_worksheet(svc, SPREADSHEET_ID_2, worksheet=ws)
+            ensure_headers(svc, SPREADSHEET_ID_2, worksheet=ws)
+            ids    |= get_existing_ticket_ids(svc, SPREADSHEET_ID_2, worksheet=ws)
+            emails |= get_existing_emails(svc, SPREADSHEET_ID_2, worksheet=ws)
+        existing_ids |= ids
+        product_state[product["name"]] = {"existing_emails": emails, "candidates": {}}
+        print(f"[Sheets] {product['name']}: {len(ids)} existing ticket IDs, {len(emails)} existing customer emails.")
 
-    # candidates[email] = (created_at_str, row) — keeps oldest ticket per customer
-    candidates = {}
     checked = matched = 0
     errors  = 0
 
@@ -350,7 +364,7 @@ def main():
 
         keyword, snippet = match
 
-        # Find Shopify order (Core One Pro only)
+        # Find Shopify order among tracked products
         order = None
         order_num = extract_order_number(ticket)
         if order_num:
@@ -358,7 +372,10 @@ def main():
         if not order:
             order = order_by_email(email)
         if not order:
-            continue  # not a Shopify Core One Pro customer
+            continue  # not a Shopify customer for any tracked product
+
+        product = classify_order(order)
+        pstate  = product_state[product["name"]]
 
         # Calculate days between purchase and ticket
         try:
@@ -368,9 +385,9 @@ def main():
         except Exception:
             days_diff = ""
 
-        # Skip if this customer already has a return intent entry in the sheet
-        if email.lower() in existing_emails:
-            print(f"[Skip] #{ticket_id} | {email} already has a return intent entry")
+        # Skip if this customer already has a return intent entry for this product
+        if email.lower() in pstate["existing_emails"]:
+            print(f"[Skip] #{ticket_id} | {email} already has a {product['name']} return intent entry")
             existing_ids.add(ticket_id)
             continue
 
@@ -386,6 +403,7 @@ def main():
         ]
         key = email.lower()
         ticket_created = ticket["created_at"]
+        candidates = pstate["candidates"]
         if key not in candidates or ticket_created < candidates[key][0]:
             if key in candidates:
                 print(f"[Dedup] #{ticket_id} replaces later ticket for {email} (keeping oldest)")
@@ -394,16 +412,20 @@ def main():
             print(f"[Dedup] #{ticket_id} skipped for {email} (older ticket already queued)")
         existing_ids.add(ticket_id)
         matched += 1
-        print(f"[Match] #{ticket_id} | {email} | {order.get('name')} | +{days_diff}d | '{keyword}'")
+        print(f"[Match] #{ticket_id} | {email} | {product['name']} | {order.get('name')} | +{days_diff}d | '{keyword}'")
 
-    new_rows = [v[1] for v in candidates.values()]
-    print(f"[Main] Checked {checked} tickets, {matched} trigger matches, {len(new_rows)} unique customers to append.")
+    total_new = 0
+    svc = sheets_service()  # Reconnect — old connection may have timed out during long scan
+    for product in PRODUCTS:
+        ws = product["worksheet"]
+        new_rows = [v[1] for v in product_state[product["name"]]["candidates"].values()]
+        total_new += len(new_rows)
+        if new_rows:
+            append_rows(svc, new_rows, worksheet=ws)
+            if SPREADSHEET_ID_2:
+                append_rows(svc, new_rows, SPREADSHEET_ID_2, worksheet=ws)
 
-    if new_rows:
-        svc = sheets_service()  # Reconnect — old connection may have timed out during long scan
-        append_rows(svc, new_rows)
-        if SPREADSHEET_ID_2:
-            append_rows(svc, new_rows, SPREADSHEET_ID_2)
+    print(f"[Main] Checked {checked} tickets, {matched} trigger matches, {total_new} unique customers to append.")
 
     state["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     save_state(state)
@@ -416,7 +438,7 @@ def main():
         "",
         f"Tickets Scanned : {checked}",
         f"Return Matches  : {matched}",
-        f"New Rows Added  : {len(new_rows)}",
+        f"New Rows Added  : {total_new}",
         f"Errors          : {errors}",
         f"Date: {date}",
     ])
