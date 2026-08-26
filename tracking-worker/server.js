@@ -147,6 +147,21 @@ function toSheetDate(isoStr) {
   return `${parseInt(p.month)}/${parseInt(p.day)}/${p.year} ${p.hour}:${p.minute}:${p.second}`;
 }
 
+// Zendesk's "Delivery Date" user field is a date type, validated against
+// \A(\d{4})-(1[0-2]|0[1-9])-(3[01]|[12]\d|0[1-9])\z — needs YYYY-MM-DD, not
+// the M/D/YYYY H:MM:SS format used for the sheet.
+function toZendeskDate(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  if (isNaN(d)) return '';
+  const pst = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(d);
+  const p = Object.fromEntries(pst.map(x => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
 async function fetchShopifyOrders(dateFrom, dateTo) {
   const orders = [];
   let url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_VERSION}/orders.json`
@@ -396,12 +411,24 @@ async function createDeliveryTicket(order, fulfillment, deliveryDate, deliverySt
     const headers = await zdHeaders();
     const createRes = await axios.post(`${ZD_BASE}/tickets.json`, ticketPayload, { headers });
     const ticketId = createRes.data.ticket.id;
+    const requesterId = createRes.data.ticket.requester_id;
 
     await axios.put(`${ZD_BASE}/tickets/${ticketId}.json`, {
       ticket: { comment: { body: noteLines.join('\n'), public: false } },
     }, { headers });
 
-    return { ticket_id: ticketId, assignee_id: assigneeId, type: 'welcome' };
+    const zdDeliveryDate = toZendeskDate(deliveryDate);
+    if (zdDeliveryDate && requesterId) {
+      try {
+        await axios.put(`${ZD_BASE}/users/${requesterId}.json`, {
+          user: { user_fields: { delivery_date: zdDeliveryDate } },
+        }, { headers });
+      } catch (e) {
+        console.warn(`  [#${order.order_number}] failed to set delivery_date on user ${requesterId}: ${e.message}`);
+      }
+    }
+
+    return { ticket_id: ticketId, assignee_id: assigneeId, requester_id: requesterId, delivery_date: zdDeliveryDate, type: 'welcome' };
 
   } else {
     // Phone only — internal call reminder for the assigned agent, no customer-facing email
