@@ -1,0 +1,14 @@
+services:
+  repeat-failure-worker:
+    build: .
+    container_name: repeat-failure-worker
+    working_dir: /app
+    env_file:
+      - ../.env.common
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ../tracking-worker/credentials:/app/credentials:ro
+    ports:
+      - "3008:3008"
+    restart: unless-stopped

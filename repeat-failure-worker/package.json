@@ -1,0 +1,11 @@
+{
+  "name": "repeat-failure-worker",
+  "version": "1.0.0",
+  "main": "server.js",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "googleapis": "^144.0.0"
+  }
+}
