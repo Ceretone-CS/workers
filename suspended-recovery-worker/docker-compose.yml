@@ -1,0 +1,8 @@
+services:
+  suspended-recovery-worker:
+    build: .
+    container_name: suspended-recovery-worker
+    env_file:
+      - ../.env.common
+      - .env
+    restart: "no"
