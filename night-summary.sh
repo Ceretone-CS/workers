@@ -29,6 +29,7 @@ lines = [
     read("updates",       "Updates"),
     read("zendesk",       "Zendesk"),
     read("return-intent", "Return"),
+    read("suspended-recovery", "Suspended"),
     "",
     f"Host: {os.uname().nodename} · {now}",
 ]
