@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import requests
@@ -50,6 +51,102 @@ def is_order_or_registration(subject):
     if "Registration" in subject and "form has a new submission" in subject:
         return True
     return False
+
+
+# Shopify storefront contact form ("Have a question?" section, /contact page).
+# Shopify mails these to info@ceretone.com, whose Exchange rule forwards them into
+# Zendesk as "FW: New customer message on ..." — so the ticket's requester is the
+# shared Support user, and agent replies would never reach the customer.
+CONTACT_FORM_SUBJECT = "New customer message on"
+CONTACT_FORM_MARKER = "You received a new message from your online store's contact form"
+CONTACT_FORM_TAG = "shopify__contactform"
+CONTACT_FORM_LOOKBACK_DAYS = 3  # only touch fresh tickets; older ones were handled by hand
+EMAIL_RE = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[A-Za-z]{2,}$")
+FW_PREFIX_RE = re.compile(r"^\s*((FW|FWD|Fw|Fwd|RE)\s*:\s*)+", re.I)
+
+
+def strip_fw(subject):
+    return FW_PREFIX_RE.sub("", subject or "").strip()
+
+
+def is_contact_form(subject, content):
+    return CONTACT_FORM_SUBJECT in (subject or "") and CONTACT_FORM_MARKER in (content or "")
+
+
+def parse_contact_form(text):
+    """Pull the customer's name/email out of the forwarded Shopify email body.
+
+    Two layouts are in use: "Name / Email / Body" (product-page section) and
+    "Name / Email / Phone Number / Message" (/contact page)."""
+    body = (text or "").split(CONTACT_FORM_MARKER, 1)[-1]
+    email_m = re.search(r"Email:\s*([^\s<>]+)", body)
+    email = email_m.group(1).strip().rstrip(".,;") if email_m else ""
+    if not EMAIL_RE.match(email):
+        return None, None
+    name_m = re.search(r"Name:\s*(.*?)\s*Email:", body, re.S)
+    name = " ".join(name_m.group(1).split()) if name_m else ""
+    return (name or email.split("@")[0]), email.lower()
+
+
+def find_or_create_user(headers, name, email):
+    r = requests.get(
+        f"{BASE_URL}/users/search.json", headers=headers, params={"query": f"email:{email}"}, timeout=30
+    )
+    r.raise_for_status()
+    for u in r.json().get("users", []):
+        if (u.get("email") or "").lower() == email:
+            return u["id"]
+    r = requests.post(
+        f"{BASE_URL}/users.json", headers=headers,
+        json={"user": {"name": name, "email": email, "role": "end-user"}}, timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["user"]["id"]
+
+
+def reassign_contact_form_tickets(headers, extra_ids=()):
+    """Point recent contact-form tickets at the actual customer instead of Support."""
+    since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - CONTACT_FORM_LOOKBACK_DAYS * 86400))
+    r = requests.get(
+        f"{BASE_URL}/search.json", headers=headers, timeout=60,
+        params={"query": f'type:ticket requester:{SUPPORT_USER_ID} created>{since} '
+                         f'subject:"{CONTACT_FORM_SUBJECT}" -tags:{CONTACT_FORM_TAG}'},
+    )
+    r.raise_for_status()
+    ids = {t["id"] for t in r.json().get("results", [])} | set(extra_ids)
+
+    reassigned, unparsed = [], []
+    for tid in sorted(ids):
+        t = requests.get(f"{BASE_URL}/tickets/{tid}.json", headers=headers, timeout=30).json()["ticket"]
+        # Re-check against the live ticket — search can lag, and someone may have fixed it by hand.
+        if t["requester_id"] != SUPPORT_USER_ID or CONTACT_FORM_TAG in t["tags"]:
+            continue
+        if not is_contact_form(t.get("subject"), t.get("description")) or t["status"] in ("solved", "closed"):
+            continue
+        name, email = parse_contact_form(t.get("description"))
+        if not email or email == SUPPORT_EMAIL:
+            unparsed.append(tid)
+            continue
+        user_id = find_or_create_user(headers, name, email)
+        requests.put(
+            f"{BASE_URL}/tickets/{tid}.json", headers=headers, timeout=30,
+            json={"ticket": {
+                "requester_id": user_id,
+                "subject": strip_fw(t.get("subject")),
+                "comment": {"public": False, "body":
+                    f"Shopify contact form submission — requester changed from {SUPPORT_EMAIL} "
+                    f"to {name} <{email}> (parsed from the message) so replies reach the customer."},
+            }},
+        ).raise_for_status()
+        # Tags endpoint, not the ticket PUT: single-ticket updates silently ignore
+        # `additional_tags` (that's an update_many-only field).
+        requests.put(
+            f"{BASE_URL}/tickets/{tid}/tags.json", headers=headers, timeout=30,
+            json={"tags": [CONTACT_FORM_TAG]},
+        ).raise_for_status()
+        reassigned.append((tid, email))
+        time.sleep(0.3)
+    return reassigned, unparsed
 
 
 def fetch_all_suspended(headers):
@@ -115,15 +212,33 @@ def main():
         if (t.get("author", {}).get("email") or "").lower() == SUPPORT_EMAIL
     ]
 
-    safe = [t for t in from_support if is_order_or_registration(t.get("subject"))]
-    ambiguous = [t for t in from_support if not is_order_or_registration(t.get("subject"))]
+    def is_safe(t):
+        return is_order_or_registration(t.get("subject")) or is_contact_form(t.get("subject"), t.get("content"))
+
+    safe = [t for t in from_support if is_safe(t)]
+    ambiguous = [t for t in from_support if not is_safe(t)]
 
     recovered, failed = ([], [])
     if safe:
         recovered, failed = recover_ids(headers_write, [t["id"] for t in safe])
 
+    # Order FW: copies keep their prefix — it's what marks them as the duplicate of the
+    # direct Shopify notification. Registrations have no direct copy, so clean those up.
+    for t in recovered:
+        if "form has a new submission" in (t.get("subject") or "") and strip_fw(t["subject"]) != t["subject"]:
+            requests.put(f"{BASE_URL}/tickets/{t['id']}.json", headers=headers_write, timeout=30,
+                         json={"ticket": {"subject": strip_fw(t["subject"])}})
+
+    # Step 3: contact-form tickets (freshly recovered or arrived normally) → real customer as requester
+    reassigned, unparsed = reassign_contact_form_tickets(
+        headers_write, [t["id"] for t in recovered if CONTACT_FORM_SUBJECT in (t.get("subject") or "")]
+    )
+
     print(f"Scanned {len(all_suspended)} suspended tickets so far")
     print(f"Recovered {len(recovered)} tickets")
+    print(f"Reassigned {len(reassigned)} contact-form tickets")
+    if unparsed:
+        print(f"Could not parse a customer email on contact-form tickets: {unparsed}")
     if failed:
         print(f"Failed to recover {len(failed)} tickets: {[t.get('id') for t in failed]}")
     if ambiguous:
@@ -135,8 +250,15 @@ def main():
         notify_discord(
             f"🔓 Ceretone suspended-ticket recovery ran\n"
             f"info@ceretone.com suspended: {was_suspended}\n"
-            f"Recovered: {len(recovered)} (Order/Registration pattern, incl. FW: duplicates)\n"
+            f"Recovered: {len(recovered)} (Order/Registration/contact-form pattern, incl. FW: duplicates)\n"
             + (f"Failed to recover: {len(failed)}\n" if failed else "")
+        )
+
+    if reassigned or unparsed:
+        notify_discord(
+            f"📨 Shopify contact-form tickets: requester set to customer on {len(reassigned)}\n"
+            + "\n".join(f"• #{tid} → {email}" for tid, email in reassigned[:15])
+            + (f"\n⚠️ No customer email found, left on Support for manual review: {unparsed}" if unparsed else "")
         )
 
     if ambiguous:
@@ -147,7 +269,7 @@ def main():
         more = f"\n…and {len(ambiguous) - 15} more" if len(ambiguous) > 15 else ""
         notify_discord(
             f"⚠️ {len(ambiguous)} suspended ticket(s) from {SUPPORT_EMAIL} don't match a known "
-            f"safe pattern (Order/Registration) and were left suspended for manual review:\n"
+            f"safe pattern (Order/Registration/contact form) and were left suspended for manual review:\n"
             + "\n".join(lines) + more +
             "\n\nCheck Zendesk Admin Center → Suspended tickets. Recover manually if genuine "
             "customer content (past examples: refund complaints, return requests, name-change "

@@ -4,6 +4,7 @@
 !.env.example
 service_account.json
 secrets/
+.secrets/
 
 # Runtime data
 data/
@@ -30,3 +31,15 @@ service_account*.json
 # Transient runtime output, not source
 tempjson/
 summaries/
+
+# Model weights / caches (too big for GitHub)
+weekly-returns-classifier/work/
+weekly-returns-classifier/state/
+weekly-returns-classifier/logs/
+
+# Service-account keys anywhere
+gsa-key*.json
+*-sa-key*.json
+
+# Dated backup copies (e.g. job.py.bak-20261012)
+*.bak-*

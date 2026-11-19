@@ -119,8 +119,12 @@ function isDeviceOrder(description) {
   return DEVICE_SKUS.some(sku => (description || '').includes(sku));
 }
 
+// Partner/wholesale accounts that place orders on behalf of end customers —
+// never make them the requester (they'd get customer surveys/welcome emails).
+const PARTNER_EMAILS = ['logistics@knocking.com', 'sales@dmesuperstore.com', 'confirmations@wholesalepoint.com'];
+
 function isPartnerEmail(email) {
-  return (email || '').trim().toLowerCase() === 'logistics@knocking.com';
+  return PARTNER_EMAILS.includes((email || '').trim().toLowerCase());
 }
 
 function getShippingBlock(description) {
@@ -442,7 +446,7 @@ app.post('/', async (req, res) => {
       if (realCustomerEmail)   updates.email = realCustomerEmail;
       if (customerPhoneFinal) updates.phone = customerPhoneFinal;
       if (partnerEmail) {
-        updates.notes = `${updates.notes || ''}\n[Auto] Partner email logistics@knocking.com detected; used Shipping address name.`.trim();
+        updates.notes = `${updates.notes || ''}\n[Auto] Partner email ${customerEmail} detected; used Shipping address name.`.trim();
       }
 
       try {

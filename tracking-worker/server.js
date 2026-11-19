@@ -163,6 +163,18 @@ function toZendeskDate(isoStr) {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
+// Partner orders never get a customer welcome ticket: Knocking orders (non-#CC
+// names) and wholesale channel orders (DME/WSP draft orders placed under the
+// partner's own account, so they look like normal #CC orders).
+const WHOLESALE_EMAILS = ['sales@dmesuperstore.com', 'confirmations@wholesalepoint.com'];
+function isPartnerOrder(order) {
+  if (!String(order.name || '').startsWith('#CC')) return true;
+  const email = String(order.email || order.customer?.email || '').trim().toLowerCase();
+  if (WHOLESALE_EMAILS.includes(email)) return true;
+  const tags = String(order.tags || '').split(',').map(t => t.trim().toLowerCase());
+  return tags.includes('wholesale') || tags.some(t => /^(dme|wsp)-/.test(t));
+}
+
 async function fetchShopifyOrders(dateFrom, dateTo) {
   const orders = [];
   let url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_VERSION}/orders.json`
@@ -613,7 +625,7 @@ app.post('/sync', async (req, res) => {
 
     const f = fulfillments[0];
     const isHearingAid    = orderHasCoreOnePro(order);
-    const isKnockingOrder = !String(order.name || '').startsWith('#CC');
+    const isKnockingOrder = isPartnerOrder(order);
 
     let deliveryDate = f.estimated_delivery_at || null;
     if (f.shipment_status === 'delivered') {
@@ -632,7 +644,7 @@ app.post('/sync', async (req, res) => {
       fulfillment_status: f.shipment_status  || f.status || '',
     });
 
-    console.log(`  [#${orderNum}] row=${row} cop=${isHearingAid} knocking=${isKnockingOrder} ship=${toSheetDate(f.created_at)} carrier=${f.tracking_company} status=${f.shipment_status || f.status} delivered=${toSheetDate(deliveryDate) || 'n/a'}`);
+    console.log(`  [#${orderNum}] row=${row} cop=${isHearingAid} partner=${isKnockingOrder} ship=${toSheetDate(f.created_at)} carrier=${f.tracking_company} status=${f.shipment_status || f.status} delivered=${toSheetDate(deliveryDate) || 'n/a'}`);
 
     orderContext.push({ order, f, deliveryDate, isHearingAid, isKnockingOrder });
 
@@ -681,7 +693,7 @@ app.post('/sync', async (req, res) => {
         failedLines.push(`${order.name}: ${msg}`);
       }
     } else if (f.shipment_status === 'delivered' && isHearingAid && isKnockingOrder) {
-      console.log(`  [#${order.order_number}] skipping delivery ticket — knocking order (${order.name})`);
+      console.log(`  [#${order.order_number}] skipping delivery ticket — partner/wholesale order (${order.name})`);
     }
 
     // Not yet delivered but otherwise eligible → keep tracking indefinitely so a
@@ -755,7 +767,7 @@ app.post('/sync', async (req, res) => {
       console.warn(`  [pending #${orderId}] delivery event fetch failed: ${e.message}`);
     }
 
-    const isKnockingOrder = !String(order.name || '').startsWith('#CC');
+    const isKnockingOrder = isPartnerOrder(order);
     if (isKnockingOrder) { delete deliveryState.pending[orderId]; continue; }
 
     try {

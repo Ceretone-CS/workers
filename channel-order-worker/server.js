@@ -44,12 +44,41 @@ const CHANNELS = {
     pendingPayment: true,
     cols:           { price: 11, carrier: 12, tracking: 13, readyCol: 14, status: 15, total: 16, draftId: 16 },
   },
+  // Wholesale Point — same draft-order + invoice flow as DME, plus Reference # (B) and Phone (E).
+  // Invoice + shipping emails go to the WSP customer's email (confirmations@wholesalepoint.com).
+  wsp: {
+    sheetId:        process.env.WSP_SHEET_ID,
+    tab:            "WSPOrders",
+    prefix:         "WSP",
+    customerId:     parseInt(process.env.WSP_CUSTOMER_ID),
+    useDraftOrder:  true,
+    sendReceipt:    process.env.WSP_SEND_RECEIPT === "true",
+    invoiceEmail:   process.env.WSP_INVOICE_EMAIL || null,
+    pendingPayment: true,
+    fields:         { purchase_order: 0, reference: 1, full_name: 3, phone: 4, address_1: 5, address_2: 6,
+                      city: 7, state: 8, post_code: 9, vendor_sku: 10, quantity: 12 },
+    cols:           { price: 13, carrier: 14, tracking: 15, readyCol: 16, status: 17, total: 18, draftId: 18 },
+  },
+};
+
+// Default sheet column positions for row fields (SS/DME layout); channels override via `fields`
+const DEFAULT_FIELDS = {
+  purchase_order: 0, full_name: 2, address_1: 3, address_2: 4, city: 5,
+  state: 6, post_code: 7, vendor_sku: 8, quantity: 10,
 };
 
 const SS_ARCHIVE_SHEET_ID = "15DpAKrJPx0oCJKyTEbmubXCCx5fcFFlp5jTfRp_Cq80";
 
-const importing  = { secretsavings: false, dme: false };
-const pendingRows = { secretsavings: new Set(), dme: new Set() }; // queued row numbers while import runs
+// Channels without a sheet or customer configured (e.g. missing env) are skipped entirely
+for (const [key, ch] of Object.entries(CHANNELS)) {
+  if (!ch.sheetId || !ch.customerId) {
+    console.warn(`[${ch.prefix}] Sheet ID or customer ID not configured — channel disabled`);
+    delete CHANNELS[key];
+  }
+}
+
+const importing   = Object.fromEntries(Object.keys(CHANNELS).map(k => [k, false]));
+const pendingRows = Object.fromEntries(Object.keys(CHANNELS).map(k => [k, new Set()])); // queued row numbers while import runs
 
 function shopifyCreds(channel) {
   return { store: channel.store || SHOPIFY_STORE, token: channel.token || SHOPIFY_TOKEN };
@@ -85,21 +114,26 @@ async function fetchSheetRows(channel) {
     `https://sheets.googleapis.com/v4/spreadsheets/${channel.sheetId}/values/${range}`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
+  const f   = { ...DEFAULT_FIELDS, ...(channel.fields || {}) };
+  const get = (row, key) => (f[key] !== undefined ? String(row[f[key]] ?? "").trim() : "");
   return (res.data.values || [])
     .map((row, i) => ({
       rowIndex:       i,
-      purchase_order: row[0]  || "",
-      full_name:      row[2]  || "",
-      address_1:      row[3]  || "",
-      address_2:      row[4]  || "",
-      city:           row[5]  || "",
-      state:          row[6]  || "",
-      post_code:      normalizeZip(row[7] || ""),
-      vendor_sku:     row[8]  || "",
-      quantity:       parseInt(row[10]) || 1,
+      purchase_order: get(row, "purchase_order"),
+      reference:      get(row, "reference"),
+      full_name:      get(row, "full_name"),
+      phone:          get(row, "phone"),
+      address_1:      get(row, "address_1"),
+      address_2:      get(row, "address_2"),
+      city:           get(row, "city"),
+      state:          get(row, "state"),
+      post_code:      normalizeZip(get(row, "post_code")),
+      vendor_sku:     get(row, "vendor_sku"),
+      quantity:       parseInt(get(row, "quantity")) || 1,
       price:          channel.cols.price !== undefined ? row[channel.cols.price] || "" : "",
       carrier:        row[channel.cols.carrier]  || "",
       tracking:       row[channel.cols.tracking] || "",
+      status:         String(row[channel.cols.status] || "").trim(),
       ready:          channel.cols.readyCol !== undefined ? String(row[channel.cols.readyCol] || "").toUpperCase() === "TRUE" : true,
     }))
     .filter(r => r.purchase_order);
@@ -458,7 +492,9 @@ async function createDraftOrder(channel, row, skuMap) {
   const variantPrice = variantInfo.price;
 
   // Compute discount needed to hit the custom price (draft orders don't accept price overrides directly)
-  const customPrice    = row.price ? parseFloat(row.price) : null;
+  // Sheet prices may be currency-formatted ("$44.25")
+  const customPrice    = row.price ? parseFloat(String(row.price).replace(/[^0-9.]/g, "")) : null;
+  if (Number.isNaN(customPrice)) return { ok: false, orderName, reason: `Invalid price: ${row.price}` };
   const discountAmount = customPrice !== null ? (variantPrice - customPrice) : 0;
 
   const parts     = row.full_name.trim().split(" ");
@@ -481,6 +517,7 @@ async function createDraftOrder(channel, row, skuMap) {
           zip:           String(row.post_code),
           country:       "United States",
           country_code:  "US",
+          ...(row.phone ? { phone: row.phone } : {}),
         },
         line_items:      [{
           variant_id:       variantId,
@@ -493,8 +530,13 @@ async function createDraftOrder(channel, row, skuMap) {
             },
           } : {}),
         }],
-        note_attributes: [{ name: "purchase_order", value: row.purchase_order }],
-        tags:            shopifyTag(channel, po), // "dme-13771" — used for lookup after payment
+        note_attributes: [
+          { name: "purchase_order", value: row.purchase_order },
+          ...(row.reference ? [{ name: "reference", value: row.reference }] : []),
+        ],
+        // "dme-13771" — used for lookup after payment; "wholesale" keeps it out of
+        // customer welcome tickets / surveys and the returns analysis
+        tags:            `${shopifyTag(channel, po)}, wholesale`,
       },
     },
     { headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" } }
@@ -548,6 +590,9 @@ async function processNewOrders(channel, targetSheetRows = null) {
     const key = existingKey(channel, po);
 
     if (!row.ready) continue;
+
+    // Already handled by an earlier trigger (onEdit can fire several times per row)
+    if (["Processed", "Paid", "Shipped"].includes(row.status)) continue;
 
     if (existingOrders.has(key)) {
       result.skipped++;
