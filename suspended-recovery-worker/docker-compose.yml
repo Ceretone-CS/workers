@@ -6,3 +6,5 @@ services:
       - ../.env.common
       - .env
     restart: "no"
+    volumes:
+      - ./main.py:/app/main.py:ro

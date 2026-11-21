@@ -53,6 +53,19 @@ def is_order_or_registration(subject):
     return False
 
 
+# Since 2026-10-27 info@ uses mailbox forwarding (not the "Zendesk" FW inbox rule), so
+# Shopify Forms registrations arrive with the CUSTOMER as author (Reply-To) and Zendesk
+# suspends them as "Detected email as being from a system user". They never match the
+# info@ author filter, so recover them by subject + Shopify Forms body marker instead.
+SHOPIFY_FORMS_MARKER = "ceretone-shop.myshopify.com/admin/apps/shopify-forms"
+
+
+def is_shopify_registration(t):
+    subject = t.get("subject") or ""
+    return ("Registration" in subject and "form has a new submission" in subject
+            and SHOPIFY_FORMS_MARKER in (t.get("content") or ""))
+
+
 # Shopify storefront contact form ("Have a question?" section, /contact page).
 # Shopify mails these to info@ceretone.com, whose Exchange rule forwards them into
 # Zendesk as "FW: New customer message on ..." — so the ticket's requester is the
@@ -216,6 +229,7 @@ def main():
         return is_order_or_registration(t.get("subject")) or is_contact_form(t.get("subject"), t.get("content"))
 
     safe = [t for t in from_support if is_safe(t)]
+    safe += [t for t in all_suspended if t not in from_support and is_shopify_registration(t)]
     ambiguous = [t for t in from_support if not is_safe(t)]
 
     recovered, failed = ([], [])
